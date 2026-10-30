@@ -42,7 +42,7 @@ def health():
     device_name = torch.cuda.get_device_name(0) if cuda_available else "CPU"
     return {
         "status": "healthy",
-        "version": "2.2-multipass",
+        "version": "3.0-multiscale",
         "cuda_available": cuda_available,
         "device": device_name,
         "use_multi_pass": settings.use_multi_pass if settings else True,
@@ -76,7 +76,7 @@ async def extract_objects(
     image_bytes = await file.read()
     try:
         custom_labels = _parse_labels(labels)
-        cutouts = extractor.extract(
+        cutouts, diagnostics = extractor.extract(
             image_bytes,
             labels=custom_labels,
             box_threshold=box_threshold,
@@ -85,7 +85,8 @@ async def extract_objects(
             nms_iou=nms_iou,
             max_objects=max_objects,
             min_objects_to_split=min_objects_to_split,
-            use_multi_pass=use_multi_pass
+            use_multi_pass=use_multi_pass,
+            return_diagnostics=True
         )
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Extraction failed: {str(e)}")
@@ -111,6 +112,11 @@ async def extract_objects(
     return {
         "filename": file.filename,
         "total_extracted": len(cutouts),
+        "diagnostics": {
+            "raw_candidates_by_category": diagnostics.get("raw_by_category", {}),
+            "kept_by_category": diagnostics.get("kept_by_category", {}),
+            "total_candidate_boxes": len(diagnostics.get("all_raw_boxes", [])),
+        },
         "objects": results
     }
 
@@ -131,7 +137,7 @@ async def extract_preview(
     image_bytes = await file.read()
     try:
         custom_labels = _parse_labels(labels)
-        cutouts = extractor.extract(
+        cutouts, diagnostics = extractor.extract(
             image_bytes,
             labels=custom_labels,
             box_threshold=box_threshold,
@@ -140,11 +146,13 @@ async def extract_preview(
             nms_iou=nms_iou,
             max_objects=max_objects,
             min_objects_to_split=min_objects_to_split,
-            use_multi_pass=use_multi_pass
+            use_multi_pass=use_multi_pass,
+            return_diagnostics=True
         )
         img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
         draw = ImageDraw.Draw(img)
 
+        # Draw detected cutout bounding boxes
         for c in cutouts:
             draw.rectangle(c.bbox, outline="red", width=4)
             draw.text((c.bbox[0] + 6, c.bbox[1] + 6), f"{c.label} {c.score:.2f}", fill="red")
@@ -152,7 +160,16 @@ async def extract_preview(
         buf = io.BytesIO()
         img.save(buf, format="JPEG", quality=90)
         buf.seek(0)
-        return Response(content=buf.getvalue(), media_type="image/jpeg")
+
+        raw_count = len(diagnostics.get("all_raw_boxes", []))
+        headers = {
+            "X-Raw-Detections-Count": str(raw_count),
+            "X-Cutouts-Count": str(len(cutouts)),
+            "X-Multi-Pass": str(use_multi_pass),
+        }
+        return Response(content=buf.getvalue(), media_type="image/jpeg", headers=headers)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Preview generation failed: {str(e)}")
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Preview generation failed: {str(e)}")
 

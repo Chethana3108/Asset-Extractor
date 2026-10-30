@@ -12,7 +12,7 @@ from dataclasses import dataclass
 
 import numpy as np
 import torch
-from PIL import Image, ImageOps
+from PIL import Image, ImageEnhance, ImageOps
 
 try:
     from torchvision.ops import nms
@@ -69,43 +69,55 @@ class CategoryRule:
     text_threshold: float
     min_area_ratio: float
     max_area_ratio: float = 0.95
+    use_contrast_enhancement: bool = False
+    use_tiles: bool = False
 
 
 DEFAULT_CATEGORY_RULES: list[CategoryRule] = [
     CategoryRule(
         name="box",
         prompt="a medicine carton . a medicine box . a packaging box . a box .",
-        box_threshold=0.22,
+        box_threshold=0.20,
         text_threshold=0.18,
         min_area_ratio=0.005,
     ),
     CategoryRule(
         name="bottle",
         prompt="a medicine bottle . a plastic bottle . a pill bottle . a bottle . a pill container .",
-        box_threshold=0.22,
+        box_threshold=0.20,
         text_threshold=0.18,
         min_area_ratio=0.005,
     ),
     CategoryRule(
         name="sachet",
-        prompt="a sachet . a packet . a white pouch . a medicine sachet . a paper sachet . a foil packet .",
-        box_threshold=0.14,
-        text_threshold=0.14,
+        prompt="a white sachet . a medicine sachet . a sealed paper packet . a rectangular foil pouch . a white packet .",
+        box_threshold=0.13,
+        text_threshold=0.13,
         min_area_ratio=0.001,
+        use_contrast_enhancement=True,
     ),
     CategoryRule(
         name="blister_pack",
-        prompt="a blister pack . a tablet strip . a pill pack . a medicine strip . a blister foil .",
-        box_threshold=0.16,
-        text_threshold=0.15,
+        prompt="a blister pack . a tablet strip . a pill pack with foil backing . a medicine blister . a blister sheet .",
+        box_threshold=0.15,
+        text_threshold=0.14,
         min_area_ratio=0.002,
     ),
     CategoryRule(
-        name="pill",
-        prompt="a tablet . a capsule . a pill . a loose pill . a white pill . a green capsule .",
-        box_threshold=0.14,
-        text_threshold=0.14,
+        name="capsule",
+        prompt="a green capsule . a two-tone capsule . a medicine capsule . a capsule .",
+        box_threshold=0.13,
+        text_threshold=0.13,
         min_area_ratio=0.00005,
+        use_tiles=True,
+    ),
+    CategoryRule(
+        name="tablet",
+        prompt="a round white tablet . a white pill . a round tablet . a medicine tablet . a pill .",
+        box_threshold=0.13,
+        text_threshold=0.13,
+        min_area_ratio=0.00005,
+        use_tiles=True,
     ),
 ]
 
@@ -122,6 +134,30 @@ def _intersection_area(b1: list[float], b2: list[float]) -> float:
     if ix1 <= ix0 or iy1 <= iy0:
         return 0.0
     return (ix1 - ix0) * (iy1 - iy0)
+
+
+def _enhance_contrast(img: Image.Image) -> Image.Image:
+    """Enhance edges and contrast for low-contrast items like white sachets on white backgrounds."""
+    ac = ImageOps.autocontrast(img.convert("RGB"), cutoff=2)
+    return ImageEnhance.Contrast(ac).enhance(1.4)
+
+
+def _get_overlapping_tiles(img: Image.Image, overlap: float = 0.20) -> list[tuple[Image.Image, int, int]]:
+    """Generate 2x2 overlapping image tiles for high-resolution small object detection."""
+    w, h = img.size
+    tw, th = int(w * (0.5 + overlap / 2)), int(h * (0.5 + overlap / 2))
+    offsets = [
+        (0, 0),
+        (w - tw, 0),
+        (0, h - th),
+        (w - tw, h - th),
+    ]
+    tiles = []
+    for ox, oy in offsets:
+        box = (ox, oy, ox + tw, oy + th)
+        tile = img.crop(box)
+        tiles.append((tile, ox, oy))
+    return tiles
 
 
 def _format_prompt(labels: list[str]) -> str:
@@ -191,46 +227,91 @@ class ObjectExtractor:
             out.pred_masks.float().cpu(), inputs["original_sizes"].cpu(), inputs["reshaped_input_sizes"].cpu())
         return masks[0][:, 0].numpy().astype(bool)  # (N, H, W)
 
-    def _multi_pass_detect(self, img: Image.Image, max_objects: int, nms_iou: float) -> list[tuple[list[float], float, str]]:
+    def _multi_pass_detect(self, img: Image.Image, max_objects: int, nms_iou: float) -> tuple[list[tuple[list[float], float, str]], dict]:
         w, h = img.size
         category_detections: list[tuple[list[float], float, str]] = []
+        diagnostics = {"raw_by_category": {}, "kept_by_category": {}, "all_raw_boxes": []}
+
+        # Precompute enhanced contrast image for low-contrast items like white sachets
+        contrast_img = _enhance_contrast(img)
+        # Precompute overlapping tiles for small items like tablets and capsules
+        tiles = _get_overlapping_tiles(img, overlap=0.20)
 
         for rule in DEFAULT_CATEGORY_RULES:
-            boxes, scores, labels = self._detect(img, rule.prompt, rule.box_threshold, rule.text_threshold)
+            raw_boxes_list = []
+            raw_scores_list = []
+            raw_labels_list = []
+
+            # 1. Full image pass
+            eval_img = contrast_img if rule.use_contrast_enhancement else img
+            b_full, s_full, l_full = self._detect(eval_img, rule.prompt, rule.box_threshold, rule.text_threshold)
+            if len(b_full) > 0:
+                raw_boxes_list.append(b_full)
+                raw_scores_list.append(s_full)
+                raw_labels_list.extend(l_full)
+
+            # 2. Overlapping tile passes for small items (tablets, capsules)
+            if rule.use_tiles:
+                for tile_img, ox, oy in tiles:
+                    tb, ts, tl = self._detect(tile_img, rule.prompt, rule.box_threshold, rule.text_threshold)
+                    if len(tb) > 0:
+                        shifted_b = tb.clone()
+                        shifted_b[:, 0] += ox
+                        shifted_b[:, 1] += oy
+                        shifted_b[:, 2] += ox
+                        shifted_b[:, 3] += oy
+                        raw_boxes_list.append(shifted_b)
+                        raw_scores_list.append(ts)
+                        raw_labels_list.extend(tl)
+
+            if not raw_boxes_list:
+                diagnostics["raw_by_category"][rule.name] = 0
+                diagnostics["kept_by_category"][rule.name] = 0
+                continue
+
+            all_boxes = torch.cat(raw_boxes_list, dim=0)
+            all_scores = torch.cat(raw_scores_list, dim=0)
+            diagnostics["raw_by_category"][rule.name] = len(all_boxes)
+            log.info("Category '%s' raw candidates: %d", rule.name, len(all_boxes))
+
+            # Per-category NMS
             filtered = self._filter(
-                boxes, scores, labels, w, h,
+                all_boxes, all_scores, raw_labels_list, w, h,
                 min_area_ratio=rule.min_area_ratio,
                 max_area_ratio=rule.max_area_ratio,
-                nms_iou=0.60,
+                nms_iou=0.55,
                 max_objects=max_objects
             )
+            diagnostics["kept_by_category"][rule.name] = len(filtered)
             for box, score, _ in filtered:
                 category_detections.append((box, score, rule.name))
+                diagnostics["all_raw_boxes"].append({"box": box, "score": round(float(score), 4), "category": rule.name})
 
         if not category_detections:
-            return []
+            return [], diagnostics
 
-        # Filter out pills that are inside a blister pack
+        # Filter out pills/capsules that are enclosed inside a blister pack
         blister_boxes = [d[0] for d in category_detections if d[2] == "blister_pack"]
         final_candidates: list[tuple[list[float], float, str]] = []
         for box, score, label in category_detections:
-            if label == "pill" and blister_boxes:
+            if label in ("pill", "capsule", "tablet") and blister_boxes:
                 p_area = _box_area(box)
-                inside = any((_intersection_area(box, bb) / p_area) > 0.60 for bb in blister_boxes if p_area > 0)
+                inside = any((_intersection_area(box, bb) / p_area) > 0.55 for bb in blister_boxes if p_area > 0)
                 if inside:
-                    continue  # Keep blister pack intact, skip individual bubbles
+                    continue  # Keep blister pack intact, skip individual internal bubbles
             final_candidates.append((box, score, label))
 
         if not final_candidates:
-            return []
+            return [], diagnostics
 
-        # Cross-category NMS to collapse duplicate detections of the exact same object
+        # Cross-category NMS: Only collapse if IoU > 0.80 (i.e. virtually identical duplicate box)
         c_boxes = torch.tensor([d[0] for d in final_candidates], dtype=torch.float32)
         c_scores = torch.tensor([d[1] for d in final_candidates], dtype=torch.float32)
-        keep_idx = nms(c_boxes, c_scores, 0.70)
+        keep_idx = nms(c_boxes, c_scores, 0.80)
 
         selected = [final_candidates[i] for i in keep_idx][:max_objects]
-        return selected
+        log.info("Total multi-scale detections kept after cross-category deduplication: %d", len(selected))
+        return selected, diagnostics
 
     # ------------------------------------------------------------------
     def extract(
@@ -245,16 +326,18 @@ class ObjectExtractor:
         max_objects: int | None = None,
         min_objects_to_split: int | None = None,
         use_multi_pass: bool | None = None,
-    ) -> list[Cutout]:
+        return_diagnostics: bool = False,
+    ) -> list[Cutout] | tuple[list[Cutout], dict]:
         multi_pass = use_multi_pass if use_multi_pass is not None else self.s.use_multi_pass
         max_obj = max_objects if max_objects is not None else self.s.max_objects
         min_split = min_objects_to_split if min_objects_to_split is not None else self.s.min_objects_to_split
         iou = nms_iou if nms_iou is not None else self.s.nms_iou
 
         full, work, scale = self._load(data)
+        diagnostics = {}
 
         if multi_pass and labels is None:
-            dets = self._multi_pass_detect(work, max_objects=max_obj, nms_iou=iou)
+            dets, diagnostics = self._multi_pass_detect(work, max_objects=max_obj, nms_iou=iou)
             log.info("Multi-pass detected %d objects", len(dets))
         else:
             box_th = box_threshold if box_threshold is not None else self.s.box_threshold
@@ -264,10 +347,15 @@ class ObjectExtractor:
             prompt = _format_prompt(labels if labels is not None else self.s.labels)
             boxes, scores, det_labels = self._detect(work, prompt, box_th, text_th)
             dets = self._filter(boxes, scores, det_labels, *work.size, min_area, max_area, iou, max_obj)
+            diagnostics = {
+                "raw_by_category": {"single_pass": len(boxes)},
+                "kept_by_category": {"single_pass": len(dets)},
+                "all_raw_boxes": [{"box": d[0], "score": round(d[1], 4), "category": d[2]} for d in dets]
+            }
             log.info("Single-pass detected %d objects after filtering (threshold=%.2f, min_area=%.4f)", len(dets), box_th, min_area)
 
         if len(dets) < min_split:
-            return []
+            return ([], diagnostics) if return_diagnostics else []
 
         masks = self._masks(work, [d[0] for d in dets]) if self.s.output_mode != "crop" else None
         W, H = full.size
@@ -284,12 +372,15 @@ class ObjectExtractor:
             if masks is not None:
                 m = Image.fromarray(masks[i].astype(np.uint8) * 255).resize((W, H), Image.NEAREST)
                 if m.getbbox() is None:
+                    log.warning("SAM mask empty for %s (score %.2f, box %s), falling back to crop", label, score, bx)
+                    results.append(Cutout(label, score, bx, _png(full.convert("RGB").crop(bx)), "crop"))
                     continue
                 rgba = full.convert("RGBA")
                 alpha = Image.fromarray(np.minimum(np.array(rgba.getchannel("A")), np.array(m)))
                 rgba.putalpha(alpha)
                 results.append(Cutout(label, score, bx, _png(rgba.crop(bx)), "cutout"))
-        return results
+
+        return (results, diagnostics) if return_diagnostics else results
 
 
 def _png(img: Image.Image) -> bytes:
