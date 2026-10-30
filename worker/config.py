@@ -45,16 +45,16 @@ class Settings:
             "DETECT_LABELS",
             # 'person' deliberately excluded: cutting real people out of source shots
             # creates likeness/consent issues downstream. Add it only if rights are cleared.
-            "product,bottle,box,package,tube,jar,can,pouch,blister pack,device,logo",
+            "product,bottle,box,package,tube,jar,can,pouch,sachet,blister pack,tablet,pill,capsule,device,logo,packet,container",
         ).split(",") if s.strip()
     ])
-    box_threshold: float = field(default_factory=lambda: float(_env("BOX_THRESHOLD", "0.35")))
-    text_threshold: float = field(default_factory=lambda: float(_env("TEXT_THRESHOLD", "0.25")))
-    nms_iou: float = field(default_factory=lambda: float(_env("NMS_IOU", "0.5")))
-    min_area_ratio: float = field(default_factory=lambda: float(_env("MIN_AREA_RATIO", "0.01")))   # drop specks
-    max_area_ratio: float = field(default_factory=lambda: float(_env("MAX_AREA_RATIO", "0.90")))   # drop "whole image"
-    max_objects: int = field(default_factory=lambda: int(_env("MAX_OBJECTS", "10")))
-    min_objects_to_split: int = field(default_factory=lambda: int(_env("MIN_OBJECTS_TO_SPLIT", "2")))
+    box_threshold: float = field(default_factory=lambda: float(_env("BOX_THRESHOLD", "0.23")))
+    text_threshold: float = field(default_factory=lambda: float(_env("TEXT_THRESHOLD", "0.20")))
+    nms_iou: float = field(default_factory=lambda: float(_env("NMS_IOU", "0.55")))
+    min_area_ratio: float = field(default_factory=lambda: float(_env("MIN_AREA_RATIO", "0.0005")))   # keep small items like pills
+    max_area_ratio: float = field(default_factory=lambda: float(_env("MAX_AREA_RATIO", "0.95")))   # drop "whole image"
+    max_objects: int = field(default_factory=lambda: int(_env("MAX_OBJECTS", "30")))
+    min_objects_to_split: int = field(default_factory=lambda: int(_env("MIN_OBJECTS_TO_SPLIT", "1")))
     padding_ratio: float = field(default_factory=lambda: float(_env("PADDING_RATIO", "0.04")))
     max_working_side: int = field(default_factory=lambda: int(_env("MAX_WORKING_SIDE", "4096")))
     output_mode: str = field(default_factory=lambda: _env("OUTPUT_MODE", "cutout"))  # cutout | crop | both

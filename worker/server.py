@@ -48,18 +48,40 @@ def health():
     }
 
 
+def _parse_labels(labels_str: Optional[str]):
+    if not labels_str:
+        return None
+    return [l.strip() for l in labels_str.split(",") if l.strip()]
+
+
 @app.post("/extract")
 async def extract_objects(
     file: UploadFile = File(...),
-    return_base64: bool = Form(default=True)
+    return_base64: bool = Form(default=True),
+    labels: Optional[str] = Form(default=None),
+    box_threshold: Optional[float] = Form(default=None),
+    text_threshold: Optional[float] = Form(default=None),
+    min_area_ratio: Optional[float] = Form(default=None),
+    nms_iou: Optional[float] = Form(default=None),
+    max_objects: Optional[int] = Form(default=None),
 ):
     """Upload an image file and receive detected objects, bounding boxes, confidence scores, and cutout PNGs."""
-    if not file.content_type.startswith("image/"):
+    if file.content_type and not file.content_type.startswith("image/"):
         raise HTTPException(status_code=400, detail="Uploaded file must be an image.")
 
     image_bytes = await file.read()
     try:
-        cutouts = extractor.extract(image_bytes)
+        custom_labels = _parse_labels(labels)
+        cutouts = extractor.extract(
+            image_bytes,
+            labels=custom_labels,
+            box_threshold=box_threshold,
+            text_threshold=text_threshold,
+            min_area_ratio=min_area_ratio,
+            nms_iou=nms_iou,
+            max_objects=max_objects,
+            min_objects_to_split=1
+        )
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Extraction failed: {str(e)}")
 
@@ -89,11 +111,29 @@ async def extract_objects(
 
 
 @app.post("/extract/preview")
-async def extract_preview(file: UploadFile = File(...)):
+async def extract_preview(
+    file: UploadFile = File(...),
+    labels: Optional[str] = Form(default=None),
+    box_threshold: Optional[float] = Form(default=None),
+    text_threshold: Optional[float] = Form(default=None),
+    min_area_ratio: Optional[float] = Form(default=None),
+    nms_iou: Optional[float] = Form(default=None),
+    max_objects: Optional[int] = Form(default=None),
+):
     """Upload an image file and receive the annotated image (JPEG) with bounding boxes and labels drawn."""
     image_bytes = await file.read()
     try:
-        cutouts = extractor.extract(image_bytes)
+        custom_labels = _parse_labels(labels)
+        cutouts = extractor.extract(
+            image_bytes,
+            labels=custom_labels,
+            box_threshold=box_threshold,
+            text_threshold=text_threshold,
+            min_area_ratio=min_area_ratio,
+            nms_iou=nms_iou,
+            max_objects=max_objects,
+            min_objects_to_split=1
+        )
         img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
         draw = ImageDraw.Draw(img)
 

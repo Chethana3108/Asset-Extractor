@@ -31,6 +31,11 @@ class Cutout:
     kind: str                         # 'cutout' | 'crop'
 
 
+def _format_prompt(labels: list[str]) -> str:
+    cleaned = [l.strip().lower() for l in labels if l.strip()]
+    return " . ".join(cleaned) + " ."
+
+
 class ObjectExtractor:
     def __init__(self, s: Settings):
         self.s = s
@@ -42,8 +47,7 @@ class ObjectExtractor:
         self.sam_proc = SamProcessor.from_pretrained(s.sam_model)
         self.sam = SamModel.from_pretrained(s.sam_model, torch_dtype=dtype).to(self.device).eval()
         self.dtype = dtype
-        # Grounding DINO prompt format: lowercase phrases, each terminated by '.'
-        self.prompt = " ".join(f"{l.lower()}." for l in s.labels)
+        self.prompt = _format_prompt(s.labels)
 
     # ------------------------------------------------------------------
     def _load(self, data: bytes) -> tuple[Image.Image, Image.Image, float]:
@@ -59,30 +63,30 @@ class ObjectExtractor:
         return rgba, rgb, scale
 
     @torch.inference_mode()
-    def _detect(self, img: Image.Image) -> tuple[torch.Tensor, torch.Tensor, list[str]]:
-        inputs = self.det_proc(images=img, text=self.prompt, return_tensors="pt").to(self.device)
+    def _detect(self, img: Image.Image, prompt: str, box_threshold: float, text_threshold: float) -> tuple[torch.Tensor, torch.Tensor, list[str]]:
+        inputs = self.det_proc(images=img, text=prompt, return_tensors="pt").to(self.device)
         out = self.det(**inputs)
-        kwargs = dict(text_threshold=self.s.text_threshold, target_sizes=[img.size[::-1]])
+        kwargs = dict(text_threshold=text_threshold, target_sizes=[img.size[::-1]])
         try:  # transformers >= 4.51 renamed box_threshold -> threshold
             res = self.det_proc.post_process_grounded_object_detection(
-                out, inputs.input_ids, threshold=self.s.box_threshold, **kwargs)[0]
+                out, inputs.input_ids, threshold=box_threshold, **kwargs)[0]
         except TypeError:
             res = self.det_proc.post_process_grounded_object_detection(
-                out, inputs.input_ids, box_threshold=self.s.box_threshold, **kwargs)[0]
+                out, inputs.input_ids, box_threshold=box_threshold, **kwargs)[0]
         labels = res.get("text_labels") or res.get("labels")
         return res["boxes"].float().cpu(), res["scores"].float().cpu(), [str(l) for l in labels]
 
-    def _filter(self, boxes, scores, labels, w, h):
+    def _filter(self, boxes, scores, labels, w, h, min_area_ratio: float, max_area_ratio: float, nms_iou: float, max_objects: int):
         if len(boxes) == 0:
             return []
         area = (boxes[:, 2] - boxes[:, 0]) * (boxes[:, 3] - boxes[:, 1]) / float(w * h)
-        keep = (area >= self.s.min_area_ratio) & (area <= self.s.max_area_ratio)
+        keep = (area >= min_area_ratio) & (area <= max_area_ratio)
         idx = torch.nonzero(keep).flatten()
         if len(idx) == 0:
             return []
         # class-agnostic NMS: "bottle" and "product" on the same object must collapse to one
-        k = nms(boxes[idx], scores[idx], self.s.nms_iou)
-        idx = idx[k][: self.s.max_objects]
+        k = nms(boxes[idx], scores[idx], nms_iou)
+        idx = idx[k][: max_objects]
         return [(boxes[i].tolist(), float(scores[i]), labels[i] or "object") for i in idx]
 
     @torch.inference_mode()
@@ -95,12 +99,33 @@ class ObjectExtractor:
         return masks[0][:, 0].numpy().astype(bool)  # (N, H, W)
 
     # ------------------------------------------------------------------
-    def extract(self, data: bytes) -> list[Cutout]:
+    def extract(
+        self,
+        data: bytes,
+        labels: list[str] | None = None,
+        box_threshold: float | None = None,
+        text_threshold: float | None = None,
+        min_area_ratio: float | None = None,
+        max_area_ratio: float | None = None,
+        nms_iou: float | None = None,
+        max_objects: int | None = None,
+        min_objects_to_split: int | None = None,
+    ) -> list[Cutout]:
+        box_th = box_threshold if box_threshold is not None else self.s.box_threshold
+        text_th = text_threshold if text_threshold is not None else self.s.text_threshold
+        min_area = min_area_ratio if min_area_ratio is not None else self.s.min_area_ratio
+        max_area = max_area_ratio if max_area_ratio is not None else self.s.max_area_ratio
+        iou = nms_iou if nms_iou is not None else self.s.nms_iou
+        max_obj = max_objects if max_objects is not None else self.s.max_objects
+        min_split = min_objects_to_split if min_objects_to_split is not None else self.s.min_objects_to_split
+
+        prompt = _format_prompt(labels if labels is not None else self.s.labels)
+
         full, work, scale = self._load(data)
-        boxes, scores, labels = self._detect(work)
-        dets = self._filter(boxes, scores, labels, *work.size)
-        log.info("Detected %d objects after filtering", len(dets))
-        if len(dets) < self.s.min_objects_to_split:
+        boxes, scores, det_labels = self._detect(work, prompt, box_th, text_th)
+        dets = self._filter(boxes, scores, det_labels, *work.size, min_area, max_area, iou, max_obj)
+        log.info("Detected %d objects after filtering (threshold=%.2f, min_area=%.4f)", len(dets), box_th, min_area)
+        if len(dets) < min_split:
             return []
 
         masks = self._masks(work, [d[0] for d in dets]) if self.s.output_mode != "crop" else None
