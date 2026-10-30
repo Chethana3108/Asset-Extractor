@@ -36,65 +36,25 @@ class Settings:
     sb_connection: str = field(default_factory=lambda: _env("SB_CONNECTION", required=True))
     sb_queue: str = field(default_factory=lambda: _env("SB_QUEUE", "ch-object-extraction"))
 
-    # --- Models / extraction ---
-    # Vision-Language Model for dynamic object identification
-    vlm_model: str = field(default_factory=lambda: _env("VLM_MODEL", "microsoft/Florence-2-base"))
-    vlm_task: str = field(default_factory=lambda: _env("VLM_TASK", "<OD>"))
-    use_dynamic_vlm: bool = field(
-        default_factory=lambda: _env("USE_DYNAMIC_VLM", "true").lower() in ("true", "1", "yes")
-    )
+    # --- GPT Vision (Image Understanding) ---
+    openai_api_key: str = field(default_factory=lambda: _env("OPENAI_API_KEY", required=True))
+    gpt_model: str = field(default_factory=lambda: _env("GPT_MODEL", "gpt-4o"))
 
-    # Grounding DINO (open-vocabulary object locator) and SAM (mask segmenter)
-    detector_model: str = field(default_factory=lambda: _env("DETECTOR_MODEL", "IDEA-Research/grounding-dino-base"))
+    # --- SAM (Segment Anything — Mask Generation) ---
     sam_model: str = field(default_factory=lambda: _env("SAM_MODEL", "facebook/sam-vit-large"))
 
-    # Optional manual fallback labels (empty by default: dynamic VLM identifies objects automatically)
-    labels: list[str] = field(default_factory=lambda: [
-        s.strip() for s in _env("DETECT_LABELS", "").split(",") if s.strip()
-    ])
-
-    box_threshold: float = field(
-        default_factory=lambda: float(_env("BOX_THRESHOLD", "0.18"))
-    )
-    text_threshold: float = field(
-        default_factory=lambda: float(_env("TEXT_THRESHOLD", "0.18"))
-    )
-    nms_iou: float = field(
-        default_factory=lambda: float(_env("NMS_IOU", "0.55"))
-    )
+    # --- Extraction parameters ---
     min_area_ratio: float = field(
         default_factory=lambda: float(_env("MIN_AREA_RATIO", "0.003"))
     )
     max_area_ratio: float = field(
         default_factory=lambda: float(_env("MAX_AREA_RATIO", "0.95"))
     )
-    containment_threshold: float = field(
-        default_factory=lambda: float(_env("CONTAINMENT_THRESHOLD", "0.88"))
-    )
-    confidence_review_threshold: float = field(
-        default_factory=lambda: float(_env("CONFIDENCE_REVIEW_THRESHOLD", "0.40"))
-    )
     max_objects: int = field(
         default_factory=lambda: int(_env("MAX_OBJECTS", "20"))
     )
     min_objects_to_split: int = field(
         default_factory=lambda: int(_env("MIN_OBJECTS_TO_SPLIT", "1"))
-    )
-
-    # Amodal Completion / Occlusion Inpainting (LaMa)
-    enable_amodal_completion: bool = field(
-        default_factory=lambda: _env("ENABLE_AMODAL_COMPLETION", "false").lower() in ("true", "1", "yes")
-    )
-    max_occlusion_ratio_to_complete: float = field(
-        default_factory=lambda: float(_env("MAX_OCCLUSION_RATIO_TO_COMPLETE", "0.45"))
-    )
-    skip_severely_occluded: bool = field(
-        default_factory=lambda: _env("SKIP_SEVERELY_OCCLUDED", "false").lower() in ("true", "1", "yes")
-    )
-
-    # Backward compatibility flag
-    use_multi_pass: bool = field(
-        default_factory=lambda: _env("USE_MULTI_PASS", "true").lower() in ("true", "1", "yes")
     )
     padding_ratio: float = field(default_factory=lambda: float(_env("PADDING_RATIO", "0.04")))
     max_working_side: int = field(default_factory=lambda: int(_env("MAX_WORKING_SIDE", "4096")))
