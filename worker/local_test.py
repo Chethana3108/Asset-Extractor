@@ -1,6 +1,11 @@
-"""Test Object Extraction locally: python local_test.py <image_path> [output_dir]
-Uses GPT-4o Vision for image understanding + SAM for pixel-precise masks.
-Writes isolated transparent PNG cutouts and an annotated preview."""
+"""Test Universal AI Object Extraction locally: python local_test.py <image_path> [output_dir]
+
+Runs the 4-Stage Architecture:
+1. GPT Vision Semantic Analysis -> Clean Object Inventory
+2. Concept Segmentation (Grounded-SAM / SAM 3.1)
+3. Python Mask Validation & Quality Assurance
+4. Sub-pixel Edge Refinement & Transparent Layer Generation
+"""
 import os
 import sys
 
@@ -11,14 +16,12 @@ os.environ.setdefault("CH_CLIENT_ID", "x")
 os.environ.setdefault("CH_CLIENT_SECRET", "x")
 os.environ.setdefault("SB_CONNECTION", "x")
 
-# OPENAI_API_KEY must be set in environment or will be read from config
 from config import Settings          # noqa: E402
 from extractor import ObjectExtractor  # noqa: E402
 
 if len(sys.argv) < 2:
     print("Usage: python local_test.py <image_path> [output_dir]")
-    print("  Ensure OPENAI_API_KEY is set in your environment.")
-    print("  Example: OPENAI_API_KEY=sk-... python local_test.py test_product.jpg output")
+    print("Example: python local_test.py testing.png output")
     sys.exit(1)
 
 src = sys.argv[1]
@@ -29,34 +32,39 @@ if not os.path.exists(src):
     sys.exit(1)
 
 os.makedirs(out, exist_ok=True)
-print(f"Loading GPT Vision + SAM pipeline and extracting objects from '{src}'...")
+print(f"Initializing 4-Stage Extraction Pipeline and analyzing '{src}'...")
 settings = Settings()
 ex = ObjectExtractor(settings)
 data = open(src, "rb").read()
 cutouts, diag = ex.extract(data, return_diagnostics=True)
 
-print(f"\n{'='*60}")
-print(f"GPT VISION + SAM EXTRACTION SUMMARY:")
-print(f"Objects Identified by GPT: {diag.get('dynamic_labels_identified', [])}")
-print(f"Total Layers Extracted:    {len(cutouts)}")
-print(f"Review Needed:             {diag.get('review_needed', False)}")
-print(f"{'='*60}\n")
+print(f"\n{'='*65}")
+print(f"UNIVERSAL AI OBJECT EXTRACTION SUMMARY:")
+print(f"GPT Semantic Inventory:   {diag.get('semantic_inventory', [])}")
+print(f"Raw Candidates Detected: {diag.get('raw_candidates_count', 0)}")
+print(f"Validated Layers Extracted: {len(cutouts)}")
+print(f"Review Needed:           {diag.get('review_needed', False)}")
+print(f"{'='*65}\n")
 
 preview = Image.open(src).convert("RGB")
 d = ImageDraw.Draw(preview)
 
 for i, c in enumerate(cutouts, 1):
-    filename = f"{i:02d}_{c.label.replace(' ', '_')}_{c.confidence_status}_{c.kind}.png"
+    safe_name = c.label.lower().replace(" ", "_").replace("/", "-")
+    filename = f"{i:02d}_{safe_name}_{c.confidence_status}.png"
     filepath = os.path.join(out, filename)
     open(filepath, "wb").write(c.png)
+
+    # Color code: Green = confirmed, Amber = needs_review
     color = "#00E676" if c.confidence_status == "confirmed" else "#FF9100"
     d.rectangle(c.bbox, outline=color, width=4)
-    tag = f"{c.label} {c.score:.2f} [{c.confidence_status}]"
+    tag = f"{c.label} ({c.score:.2f}) [{c.confidence_status}]"
     d.text((c.bbox[0] + 6, max(0, c.bbox[1] - 16)), tag, fill=color)
-    print(f"  [{i:02d}] {c.label:20s} (score: {c.score:.2f}, status: {c.confidence_status:12s}, "
-          f"area: {c.area_ratio:.3f}) -> {filename}")
+
+    print(f"  [{i:02d}] {c.label:24s} (score: {c.score:.2f}, status: {c.confidence_status:12s}, "
+          f"area: {c.area_ratio:.3f}, cat: {c.category:10s}) -> {filename}")
 
 preview_path = os.path.join(out, "_preview.jpg")
-preview.save(preview_path)
+preview.save(preview_path, quality=92)
 print(f"\nPreview saved to: {preview_path}")
-print(f"All {len(cutouts)} layers saved to directory: '{out}/'\n")
+print(f"All {len(cutouts)} transparent layers saved to: '{out}/'\n")

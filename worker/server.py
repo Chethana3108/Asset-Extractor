@@ -1,14 +1,16 @@
 """FastAPI server for Universal Object Extraction Engine.
 
-Architecture: GPT-4o Vision (Image Understanding) + SAM (Segmentation)
-Endpoints for interactive testing via Postman / cURL and DAM integration.
+4-Stage Architecture:
+1. GPT Vision Semantic Analysis
+2. Concept Segmentation (Grounded-SAM / SAM 3.1)
+3. Python Mask Validation & Quality Assurance
+4. Sub-pixel Edge Refinement & Transparent Layer Generation
 """
 import base64
 import io
 import os
 from typing import Optional
 
-# Set fallback defaults so testing doesn't crash without Content Hub env vars
 os.environ.setdefault("CH_BASE_URL", "http://localhost")
 os.environ.setdefault("CH_CLIENT_ID", "test-client")
 os.environ.setdefault("CH_CLIENT_SECRET", "test-secret")
@@ -23,11 +25,10 @@ from extractor import ObjectExtractor
 
 app = FastAPI(
     title="Universal AI Object Extraction Engine",
-    description="GPT-4o Vision (Image Understanding) + SAM (Segmentation) — clean transparent layer extraction",
-    version="5.0.0"
+    description="4-Stage Layer Extraction: GPT Vision + Concept Segmentation + Mask QA Validation + Sub-pixel Refinement",
+    version="6.0.0"
 )
 
-# Initialize settings and extractor
 settings: Optional[Settings] = None
 extractor: Optional[ObjectExtractor] = None
 
@@ -46,14 +47,22 @@ def health():
     device_name = torch.cuda.get_device_name(0) if cuda_available else "CPU"
     return {
         "status": "healthy",
-        "version": "5.0-gpt-sam-engine",
+        "version": "6.0-universal-4stage",
         "cuda_available": cuda_available,
         "device": device_name,
+        "sam3_available": extractor.sam3_available if extractor else False,
         "models": {
             "gpt_model": settings.gpt_model if settings else "gpt-4o",
+            "detector_model": settings.detector_model if settings else "IDEA-Research/grounding-dino-base",
             "sam_model": settings.sam_model if settings else "facebook/sam-vit-large",
         },
     }
+
+
+def _parse_labels(labels_str: Optional[str]):
+    if not labels_str:
+        return None
+    return [l.strip() for l in labels_str.split(",") if l.strip()]
 
 
 @app.post("/extract")
@@ -61,17 +70,18 @@ async def extract_objects(
     file: UploadFile = File(...),
     return_base64: bool = Form(default=True),
     labels: Optional[str] = Form(default=None),
-    max_objects: Optional[int] = Form(default=None),
 ):
-    """Upload any image file and extract isolated product cutouts with GPT Vision + SAM."""
+    """Upload any image file and extract isolated product cutouts with 4-stage pipeline."""
     if file.content_type and not file.content_type.startswith("image/"):
         raise HTTPException(status_code=400, detail="Uploaded file must be an image.")
 
     image_bytes = await file.read()
     try:
+        custom_labels = _parse_labels(labels)
         cutouts, diagnostics = extractor.extract(
             image_bytes,
-            return_diagnostics=True,
+            labels=custom_labels,
+            return_diagnostics=True
         )
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Extraction failed: {str(e)}")
@@ -81,6 +91,7 @@ async def extract_objects(
         item = {
             "index": i,
             "label": c.label,
+            "category": c.category,
             "score": round(float(c.score), 4),
             "confidence_status": c.confidence_status,
             "area_ratio": c.area_ratio,
@@ -100,7 +111,11 @@ async def extract_objects(
         "filename": file.filename,
         "total_extracted": len(cutouts),
         "review_needed": diagnostics.get("review_needed", False),
-        "gpt_labels_identified": diagnostics.get("dynamic_labels_identified", []),
+        "semantic_inventory": diagnostics.get("semantic_inventory", []),
+        "diagnostics": {
+            "raw_candidates_count": diagnostics.get("raw_candidates_count", 0),
+            "validated_objects_count": diagnostics.get("validated_objects_count", 0),
+        },
         "objects": results
     }
 
@@ -113,15 +128,15 @@ async def extract_preview(
     """Upload an image file and receive the annotated image with color-coded bounding boxes."""
     image_bytes = await file.read()
     try:
+        custom_labels = _parse_labels(labels)
         cutouts, diagnostics = extractor.extract(
             image_bytes,
-            return_diagnostics=True,
+            labels=custom_labels,
+            return_diagnostics=True
         )
         img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
         draw = ImageDraw.Draw(img)
 
-        # Draw detected cutout bounding boxes
-        # Green = confirmed, Amber = needs_review
         for c in cutouts:
             color = "#00E676" if c.confidence_status == "confirmed" else "#FF9100"
             draw.rectangle(c.bbox, outline=color, width=4)
@@ -132,11 +147,11 @@ async def extract_preview(
         img.save(buf, format="JPEG", quality=90)
         buf.seek(0)
 
-        gpt_labels = ",".join(diagnostics.get("dynamic_labels_identified", []))
+        sem_inv = ",".join(diagnostics.get("semantic_inventory", []))
         headers = {
             "X-Total-Extracted": str(len(cutouts)),
             "X-Review-Needed": str(diagnostics.get("review_needed", False)),
-            "X-GPT-Labels": gpt_labels[:200],
+            "X-Semantic-Inventory": sem_inv[:200],
         }
         return Response(content=buf.getvalue(), media_type="image/jpeg", headers=headers)
     except Exception as e:
