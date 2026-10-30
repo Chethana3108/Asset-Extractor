@@ -13,7 +13,37 @@ from dataclasses import dataclass
 import numpy as np
 import torch
 from PIL import Image, ImageOps
-from torchvision.ops import nms
+
+try:
+    from torchvision.ops import nms
+except (ImportError, ModuleNotFoundError):
+    def nms(boxes: torch.Tensor, scores: torch.Tensor, iou_threshold: float) -> torch.Tensor:
+        """Pure PyTorch fallback when torchvision is not installed."""
+        if boxes.numel() == 0:
+            return torch.empty((0,), dtype=torch.int64, device=boxes.device)
+        x1 = boxes[:, 0]
+        y1 = boxes[:, 1]
+        x2 = boxes[:, 2]
+        y2 = boxes[:, 3]
+        areas = (x2 - x1).clamp(min=0.0) * (y2 - y1).clamp(min=0.0)
+        _, order = scores.sort(0, descending=True)
+        keep = []
+        while order.numel() > 0:
+            i = order[0].item()
+            keep.append(i)
+            if order.numel() == 1:
+                break
+            xx1 = x1[order[1:]].clamp(min=x1[i])
+            yy1 = y1[order[1:]].clamp(min=y1[i])
+            xx2 = x2[order[1:]].clamp(max=x2[i])
+            yy2 = y2[order[1:]].clamp(max=y2[i])
+            w = (xx2 - xx1).clamp(min=0.0)
+            h = (yy2 - yy1).clamp(min=0.0)
+            inter = w * h
+            ovr = inter / (areas[i] + areas[order[1:]] - inter + 1e-7)
+            inds = (ovr <= iou_threshold).nonzero(as_tuple=False).squeeze(1)
+            order = order[inds + 1]
+        return torch.tensor(keep, dtype=torch.int64, device=boxes.device)
 from transformers import (AutoModelForZeroShotObjectDetection, AutoProcessor,
                           SamModel, SamProcessor)
 
