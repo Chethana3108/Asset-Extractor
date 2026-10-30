@@ -1,5 +1,6 @@
-"""Tune thresholds locally without Content Hub: python local_test.py shot.jpg output/
-Writes each cutout PNG plus a preview with boxes drawn."""
+"""Test Universal AI Object Extraction locally: python local_test.py <image_path> [output_dir]
+Understands the image with Florence-2, localizes with Grounding DINO, segments with SAM,
+and writes isolated transparent PNG cutouts and annotated preview."""
 import os
 import sys
 
@@ -26,22 +27,36 @@ if not os.path.exists(src):
     sys.exit(1)
 
 os.makedirs(out, exist_ok=True)
-print(f"Loading models and extracting objects from '{src}'...")
-ex = ObjectExtractor(Settings())
+print(f"Loading Universal 3-Model Pipeline and extracting objects from '{src}'...")
+settings = Settings()
+ex = ObjectExtractor(settings)
 data = open(src, "rb").read()
-cutouts = ex.extract(data)
+cutouts, diag = ex.extract(data, return_diagnostics=True)
 
-print(f"\nExtraction complete! Found {len(cutouts)} objects:")
+print(f"\n==================================================")
+print(f"UNIVERSAL AI EXTRACTION SUMMARY:")
+print(f"Dynamic Labels Identified: {diag.get('dynamic_labels_identified', [])}")
+print(f"Total Objects Extracted:   {len(cutouts)}")
+print(f"Review Needed:             {diag.get('review_needed', False)}")
+print(f"Diagnostics:               {diag.get('dino_raw_boxes_count', 0)} raw DINO boxes, "
+      f"{diag.get('containment_suppressed_count', 0)} sub-parts suppressed")
+print(f"==================================================\n")
+
 preview = Image.open(src).convert("RGB")
 d = ImageDraw.Draw(preview)
 
 for i, c in enumerate(cutouts, 1):
-    filename = f"{i:02d}_{c.label}_{c.kind}.png"
+    completed_tag = "completed" if c.is_completed else "raw"
+    filename = f"{i:02d}_{c.label}_{c.confidence_status}_{completed_tag}_{c.kind}.png"
     filepath = os.path.join(out, filename)
     open(filepath, "wb").write(c.png)
-    d.rectangle(c.bbox, outline="red", width=4)
-    d.text((c.bbox[0] + 6, c.bbox[1] + 6), f"{c.label} {c.score:.2f}", fill="red")
-    print(f"  [{i:02d}] {c.label:15s} (score: {c.score:.2f}) -> {filename}  bbox: {c.bbox}")
+    color = "#00E676" if c.confidence_status == "confirmed" else "#FF9100"
+    d.rectangle(c.bbox, outline=color, width=4)
+    tag = f"{c.label} {c.score:.2f} [{c.confidence_status}]"
+    if c.is_completed:
+        tag += f" (inpainted occ:{c.occlusion_ratio:.2f})"
+    d.text((c.bbox[0] + 6, max(0, c.bbox[1] - 16)), tag, fill=color)
+    print(f"  [{i:02d}] {c.label:12s} (score: {c.score:.2f}, status: {c.confidence_status:12s}, area: {c.area_ratio:.3f}, completed: {str(c.is_completed):5s}, occ_ratio: {c.occlusion_ratio:.3f}) -> {filename}")
 
 preview_path = os.path.join(out, "_preview.jpg")
 preview.save(preview_path)
