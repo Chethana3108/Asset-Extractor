@@ -43,18 +43,32 @@ class Settings:
     labels: list[str] = field(default_factory=lambda: [
         s.strip() for s in _env(
             "DETECT_LABELS",
-            # 'person' deliberately excluded: cutting real people out of source shots
-            # creates likeness/consent issues downstream. Add it only if rights are cleared.
-            "product,bottle,box,package,tube,jar,can,pouch,sachet,blister pack,tablet,pill,capsule,device,logo,packet,container",
+            "medicine carton,medicine box,medicine bottle,"
+            "sachet,blister pack,medicine strip,"
+            "tablet,capsule,medicine pouch",
         ).split(",") if s.strip()
     ])
-    box_threshold: float = field(default_factory=lambda: float(_env("BOX_THRESHOLD", "0.23")))
-    text_threshold: float = field(default_factory=lambda: float(_env("TEXT_THRESHOLD", "0.20")))
-    nms_iou: float = field(default_factory=lambda: float(_env("NMS_IOU", "0.55")))
-    min_area_ratio: float = field(default_factory=lambda: float(_env("MIN_AREA_RATIO", "0.0005")))   # keep small items like pills
-    max_area_ratio: float = field(default_factory=lambda: float(_env("MAX_AREA_RATIO", "0.95")))   # drop "whole image"
-    max_objects: int = field(default_factory=lambda: int(_env("MAX_OBJECTS", "30")))
-    min_objects_to_split: int = field(default_factory=lambda: int(_env("MIN_OBJECTS_TO_SPLIT", "1")))
+    box_threshold: float = field(
+        default_factory=lambda: float(_env("BOX_THRESHOLD", "0.25"))
+    )
+    text_threshold: float = field(
+        default_factory=lambda: float(_env("TEXT_THRESHOLD", "0.20"))
+    )
+    nms_iou: float = field(
+        default_factory=lambda: float(_env("NMS_IOU", "0.65"))
+    )
+    min_area_ratio: float = field(
+        default_factory=lambda: float(_env("MIN_AREA_RATIO", "0.002"))
+    )
+    max_area_ratio: float = field(
+        default_factory=lambda: float(_env("MAX_AREA_RATIO", "0.90"))
+    )
+    max_objects: int = field(
+        default_factory=lambda: int(_env("MAX_OBJECTS", "15"))
+    )
+    min_objects_to_split: int = field(
+        default_factory=lambda: int(_env("MIN_OBJECTS_TO_SPLIT", "2"))
+    )
     padding_ratio: float = field(default_factory=lambda: float(_env("PADDING_RATIO", "0.04")))
     max_working_side: int = field(default_factory=lambda: int(_env("MAX_WORKING_SIDE", "4096")))
     output_mode: str = field(default_factory=lambda: _env("OUTPUT_MODE", "cutout"))  # cutout | crop | both

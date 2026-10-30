@@ -64,6 +64,7 @@ async def extract_objects(
     min_area_ratio: Optional[float] = Form(default=None),
     nms_iou: Optional[float] = Form(default=None),
     max_objects: Optional[int] = Form(default=None),
+    min_objects_to_split: Optional[int] = Form(default=None),
 ):
     """Upload an image file and receive detected objects, bounding boxes, confidence scores, and cutout PNGs."""
     if file.content_type and not file.content_type.startswith("image/"):
@@ -80,7 +81,7 @@ async def extract_objects(
             min_area_ratio=min_area_ratio,
             nms_iou=nms_iou,
             max_objects=max_objects,
-            min_objects_to_split=1
+            min_objects_to_split=min_objects_to_split
         )
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Extraction failed: {str(e)}")
@@ -119,6 +120,7 @@ async def extract_preview(
     min_area_ratio: Optional[float] = Form(default=None),
     nms_iou: Optional[float] = Form(default=None),
     max_objects: Optional[int] = Form(default=None),
+    min_objects_to_split: Optional[int] = Form(default=None),
 ):
     """Upload an image file and receive the annotated image (JPEG) with bounding boxes and labels drawn."""
     image_bytes = await file.read()
@@ -132,7 +134,7 @@ async def extract_preview(
             min_area_ratio=min_area_ratio,
             nms_iou=nms_iou,
             max_objects=max_objects,
-            min_objects_to_split=1
+            min_objects_to_split=min_objects_to_split
         )
         img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
         draw = ImageDraw.Draw(img)
