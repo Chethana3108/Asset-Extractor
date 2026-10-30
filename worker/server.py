@@ -170,11 +170,9 @@ async def extract_preview(
         return Response(content=buf.getvalue(), media_type="image/jpeg", headers=headers)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Preview generation failed: {str(e)}")
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Preview generation failed: {str(e)}")
 
 
 if __name__ == "__main__":
     import uvicorn
-    port = int(os.getenv("PORT", 8000))
+    port = int(os.getenv("PORT", 6006))
     uvicorn.run("server:app", host="0.0.0.0", port=port, reload=False)
