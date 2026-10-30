@@ -76,46 +76,46 @@ class CategoryRule:
 DEFAULT_CATEGORY_RULES: list[CategoryRule] = [
     CategoryRule(
         name="box",
-        prompt="a medicine carton . a medicine box . a packaging box . a box .",
-        box_threshold=0.20,
-        text_threshold=0.18,
+        prompt="a medicine carton . a medicine box . a cardboard box . an open box . a packaging box .",
+        box_threshold=0.28,
+        text_threshold=0.20,
         min_area_ratio=0.005,
     ),
     CategoryRule(
         name="bottle",
-        prompt="a medicine bottle . a plastic bottle . a pill bottle . a bottle . a pill container .",
-        box_threshold=0.20,
-        text_threshold=0.18,
+        prompt="a medicine bottle . a white plastic bottle . a pill bottle with cap . a medicine bottle with white cap .",
+        box_threshold=0.28,
+        text_threshold=0.20,
         min_area_ratio=0.005,
     ),
     CategoryRule(
         name="sachet",
-        prompt="a white sachet . a medicine sachet . a sealed paper packet . a rectangular foil pouch . a white packet .",
-        box_threshold=0.13,
-        text_threshold=0.13,
-        min_area_ratio=0.001,
+        prompt="a white sachet . a sealed paper packet . a rectangular medicine sachet .",
+        box_threshold=0.25,
+        text_threshold=0.20,
+        min_area_ratio=0.002,
         use_contrast_enhancement=True,
     ),
     CategoryRule(
         name="blister_pack",
-        prompt="a blister pack . a tablet strip . a pill pack with foil backing . a medicine blister . a blister sheet .",
-        box_threshold=0.15,
-        text_threshold=0.14,
-        min_area_ratio=0.002,
+        prompt="a blister pack with pills . a tablet strip . a medicine blister pack .",
+        box_threshold=0.28,
+        text_threshold=0.20,
+        min_area_ratio=0.005,
     ),
     CategoryRule(
         name="capsule",
         prompt="a green capsule . a two-tone capsule . a medicine capsule . a capsule .",
-        box_threshold=0.13,
-        text_threshold=0.13,
+        box_threshold=0.25,
+        text_threshold=0.20,
         min_area_ratio=0.00005,
         use_tiles=True,
     ),
     CategoryRule(
         name="tablet",
         prompt="a round white tablet . a white pill . a round tablet . a medicine tablet . a pill .",
-        box_threshold=0.13,
-        text_threshold=0.13,
+        box_threshold=0.25,
+        text_threshold=0.20,
         min_area_ratio=0.00005,
         use_tiles=True,
     ),
@@ -290,27 +290,33 @@ class ObjectExtractor:
         if not category_detections:
             return [], diagnostics
 
-        # Filter out pills/capsules that are enclosed inside a blister pack
-        blister_boxes = [d[0] for d in category_detections if d[2] == "blister_pack"]
+        # Remove sub-part detections enclosed inside a larger parent object (e.g. blister bubbles inside a blister pack, bottle cap slivers)
         final_candidates: list[tuple[list[float], float, str]] = []
-        for box, score, label in category_detections:
-            if label in ("pill", "capsule", "tablet") and blister_boxes:
-                p_area = _box_area(box)
-                inside = any((_intersection_area(box, bb) / p_area) > 0.55 for bb in blister_boxes if p_area > 0)
-                if inside:
-                    continue  # Keep blister pack intact, skip individual internal bubbles
-            final_candidates.append((box, score, label))
+        for i, (box_a, score_a, label_a) in enumerate(category_detections):
+            area_a = _box_area(box_a)
+            is_subpart = False
+            for j, (box_b, score_b, label_b) in enumerate(category_detections):
+                if i == j:
+                    continue
+                area_b = _box_area(box_b)
+                if area_b > 1.6 * area_a:
+                    inter = _intersection_area(box_a, box_b)
+                    if (inter / area_a) > 0.60:
+                        is_subpart = True
+                        break
+            if not is_subpart:
+                final_candidates.append((box_a, score_a, label_a))
 
         if not final_candidates:
             return [], diagnostics
 
-        # Cross-category NMS: Only collapse if IoU > 0.80 (i.e. virtually identical duplicate box)
+        # Standard NMS (IoU 0.45) to collapse duplicate boxes and tile overlaps into one best box per product
         c_boxes = torch.tensor([d[0] for d in final_candidates], dtype=torch.float32)
         c_scores = torch.tensor([d[1] for d in final_candidates], dtype=torch.float32)
-        keep_idx = nms(c_boxes, c_scores, 0.80)
+        keep_idx = nms(c_boxes, c_scores, 0.45)
 
         selected = [final_candidates[i] for i in keep_idx][:max_objects]
-        log.info("Total multi-scale detections kept after cross-category deduplication: %d", len(selected))
+        log.info("Total clean detections after deduplication: %d", len(selected))
         return selected, diagnostics
 
     # ------------------------------------------------------------------
