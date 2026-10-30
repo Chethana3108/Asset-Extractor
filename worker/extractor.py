@@ -97,6 +97,10 @@ NON_OBJECT_WORDS = {
     "floor", "wall", "ceiling", "table", "counter", "desk", "shelf", "wood", "tile", "white background",
     "image", "photo", "picture", "scene", "display", "view", "area", "side", "color", "colour",
     "the", "a", "an", "of", "and", "in", "on", "at", "is", "are", "with", "for", "to",
+    # Scene-level / category terms that cause DINO to draw one giant box
+    "items", "products", "supplies", "stuff", "things", "objects", "collection", "set", "group",
+    "assortment", "variety", "arrangement", "contents", "accessories", "equipment", "materials",
+    "medical supplies", "healthcare", "pharmaceutical",
 }
 
 
@@ -209,10 +213,8 @@ class ObjectExtractor:
 
         Uses a multi-pass strategy:
         1. <OD> for primary object detection labels.
-        2. <DENSE_REGION_CAPTION> always (not just as fallback) to catch objects
-           that <OD> misses — descriptive items, small objects, etc.
-        3. Extracts noun-phrase object terms from dense captions to enrich the
-           label set for Grounding DINO.
+        2. <DENSE_REGION_CAPTION> always runs to catch objects that <OD> misses.
+        Labels are cleaned: max 3 words, deduplicated, no repeated words, no scene-level terms.
         """
         w, h = img.size
         # Florence-2 DaViT backbone expects square 768x768 RGB inputs
@@ -224,10 +226,22 @@ class ObjectExtractor:
 
         def _add_label(lbl: str) -> bool:
             """Clean, validate, and deduplicate a label. Returns True if new."""
-            cleaned = lbl.strip().lower()
+            cleaned = lbl.strip().lower().strip(".")
             if not cleaned or cleaned in NON_OBJECT_WORDS:
                 return False
             if len(cleaned) < 2 or not any(c.isalnum() for c in cleaned):
+                return False
+            # Remove repeated words (e.g. "medical supplies medical supplies" -> "medical supplies")
+            words = cleaned.split()
+            deduped = []
+            for word in words:
+                if word not in NON_OBJECT_WORDS and (not deduped or word != deduped[-1]):
+                    deduped.append(word)
+            cleaned = " ".join(deduped)
+            if not cleaned:
+                return False
+            # Max 3 words per label — longer phrases are scene descriptions, not objects
+            if len(cleaned.split()) > 3:
                 return False
             if cleaned in seen:
                 return False
@@ -285,52 +299,17 @@ class ObjectExtractor:
             dense_results = c_parsed.get(caption_task, {})
             for lbl in dense_results.get("labels", []):
                 c_lbl = lbl.strip().lower().rstrip(".").strip()
-                # Extract object nouns from descriptive captions
-                # e.g., "a white pill bottle" -> also add "pill bottle", "bottle"
                 _add_label(c_lbl)
                 # Extract tail noun phrases for better grounding
-                words = c_lbl.split()
+                words = [w for w in c_lbl.split() if w not in NON_OBJECT_WORDS]
                 if len(words) >= 2:
-                    # Add last 1-2 words as standalone label (e.g. "blister pack" from "yellow blister pack")
                     _add_label(" ".join(words[-2:]))
-                    if len(words) >= 3:
-                        _add_label(words[-1])
+                if len(words) >= 3:
+                    _add_label(" ".join(words[-3:]))
+                if words:
+                    _add_label(words[-1])
         except Exception as e:
             log.warning("Florence-2 dense region caption pass failed: %s", e)
-
-        # --- Pass 3: <MORE_DETAILED_CAPTION> to catch any remaining object types ---
-        try:
-            detail_task = "<MORE_DETAILED_CAPTION>"
-            d_inputs = self.vlm_proc(text=detail_task, images=square_img, return_tensors="pt").to(self.device)
-            d_inputs["pixel_values"] = d_inputs["pixel_values"].to(self.dtype)
-            d_ids = self.vlm_model.generate(
-                input_ids=d_inputs["input_ids"],
-                pixel_values=d_inputs["pixel_values"],
-                max_new_tokens=256,
-                num_beams=1,
-                do_sample=False,
-                use_cache=False,
-            )
-            d_text = self.vlm_proc.batch_decode(d_ids, skip_special_tokens=False)[0]
-            d_parsed = self.vlm_proc.post_process_generation(d_text, task=detail_task, image_size=(w, h))
-            caption_str = d_parsed.get(detail_task, "")
-            if isinstance(caption_str, str) and caption_str:
-                # Extract potential object nouns from the detailed caption
-                import re as _re
-                # Simple noun-phrase extraction: look for adjective+noun patterns
-                # Split on common delimiters and extract short noun phrases
-                fragments = _re.split(r'[,;.!?]', caption_str.lower())
-                for frag in fragments:
-                    frag = frag.strip()
-                    words = frag.split()
-                    if 1 <= len(words) <= 4:
-                        _add_label(frag)
-                    elif len(words) > 4:
-                        # Try last 2-3 words as object label
-                        _add_label(" ".join(words[-3:]))
-                        _add_label(" ".join(words[-2:]))
-        except Exception as e:
-            log.warning("Florence-2 detailed caption pass failed: %s", e)
 
         log.info("Florence-2 dynamically identified %d labels: %s", len(discovered_labels), discovered_labels)
         return discovered_labels, vlm_detections
@@ -519,28 +498,23 @@ class ObjectExtractor:
 
         Steps:
         1. Upscale with BILINEAR (not NEAREST) for smooth sub-pixel edges.
-        2. Morphological erosion to pull mask boundary inward by ~1-2px,
-           preventing background fringe bleed.
-        3. Gaussian blur on the edge band for natural anti-aliasing.
+        2. Gentle morphological erosion (1-2px) to prevent background fringe.
+        3. Gaussian blur on the edge band only for natural anti-aliasing.
         """
         # Step 1: Bilinear upscale from working resolution to full resolution
         mask_uint8 = (mask_bool.astype(np.uint8) * 255)
         mask_pil = Image.fromarray(mask_uint8, mode="L").resize((W, H), Image.BILINEAR)
         alpha = np.array(mask_pil, dtype=np.float32)  # 0..255 with smooth gradients
 
-        # Step 2: Light morphological erosion to remove background fringe at edges
-        # Erode only the hard-thresholded binary mask, then re-apply to the smooth alpha
+        # Step 2: Very gentle erosion — just 1px to trim background fringe
         binary = (alpha > 127).astype(np.uint8)
-        erode_size = max(2, min(int(min(W, H) * 0.002), 5))  # adaptive: 2-5px
-        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (erode_size, erode_size))
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
         eroded = cv2.erode(binary, kernel, iterations=1)
 
-        # Step 3: Gaussian blur on the eroded mask for anti-aliased edges
-        blur_size = max(3, erode_size | 1)  # must be odd
-        smoothed = cv2.GaussianBlur(eroded.astype(np.float32) * 255.0, (blur_size, blur_size), 0)
+        # Step 3: Gaussian blur on the eroded mask for soft anti-aliased edges
+        smoothed = cv2.GaussianBlur(eroded.astype(np.float32) * 255.0, (3, 3), 0)
 
         # Combine: keep the interior solid (255), only soften at edges
-        # Where eroded mask is solid, force 255; at edges, use the blurred value
         result = np.where(eroded > 0, 255.0, smoothed)
         return np.clip(result, 0, 255).astype(np.float32)
 

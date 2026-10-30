@@ -83,7 +83,7 @@ class Settings:
 
     # Amodal Completion / Occlusion Inpainting (LaMa)
     enable_amodal_completion: bool = field(
-        default_factory=lambda: _env("ENABLE_AMODAL_COMPLETION", "true").lower() in ("true", "1", "yes")
+        default_factory=lambda: _env("ENABLE_AMODAL_COMPLETION", "false").lower() in ("true", "1", "yes")
     )
     max_occlusion_ratio_to_complete: float = field(
         default_factory=lambda: float(_env("MAX_OCCLUSION_RATIO_TO_COMPLETE", "0.45"))
