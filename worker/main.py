@@ -92,6 +92,9 @@ class Processor:
                         s.prop_confidence: round(c.score, 4),
                         s.prop_bbox: json.dumps({"x0": c.bbox[0], "y0": c.bbox[1],
                                                  "x1": c.bbox[2], "y1": c.bbox[3], "kind": c.kind}),
+                        s.prop_canvas_width: c.canvas_width,
+                        s.prop_canvas_height: c.canvas_height,
+                        s.prop_area_ratio: c.area_ratio,
                     },
                     # OneToMany self-relation: child side holds a single 'parent'
                     relations={s.rel_parent: {"parent": {"href": self.ch.entity_href(asset_id)}}},

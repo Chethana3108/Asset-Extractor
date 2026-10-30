@@ -1,22 +1,12 @@
-"""Universal AI Object Extraction Engine — 4-Stage Architecture.
+"""Universal AI Object Extraction Engine — GPT Decomposition + SAM 3 Full-Canvas Layer Extraction.
 
-Architecture:
-1. Stage 1: GPT Vision Semantic Analysis
-   - High-level scene understanding and structured element cataloging.
-   - Distinguishes foreground products from background, tables, shadows, reflections.
-   - Emits a precise object inventory with descriptive concept prompts (no flawed coordinates).
-2. Stage 2: Concept Segmentation (SAM 3.1 / Grounded-SAM)
-   - Translates GPT's semantic concept prompts into pixel-precise object masks.
-   - Supports SAM 3 / 3.1 promptable concept segmentation when available.
-   - Provides Grounded-SAM (Grounding DINO + SAM ViT-Large) for robust open-vocabulary segmentation.
-3. Stage 3: Python Mask Validation & Quality Assurance
-   - Discards background leaks (masks touching all borders or covering > 90% area).
-   - Suppresses duplicate extractions using pairwise mask IoU.
-   - Validates mask quality using real SAM IoU confidence scores (not guessed LLM scores).
-4. Stage 4: Sub-pixel Edge Refinement & Layer Export
-   - Morphological cleanup of stray pixels.
-   - Smooth anti-aliased edge blending.
-   - Exports clean transparent RGBA PNG cutouts.
+Rules:
+1. Every extracted PNG has EXACTLY the same width, height and coordinate system as the original image.
+   The extracted object remains in its original position; all pixels outside its mask become transparent.
+2. Only meaningful, independent objects become layers. Sub-components (flaps, caps, blister cavities)
+   are never extracted separately. Grouped items (scattered tablets, capsules) become single unified group layers.
+3. GPT Vision acts as the semantic asset decomposition planner, determining what to extract.
+4. SAM 3 generates pixel-level masks via text-promptable concept segmentation.
 """
 from __future__ import annotations
 
@@ -32,8 +22,6 @@ import numpy as np
 import requests
 import torch
 from PIL import Image, ImageOps
-from transformers import (AutoModelForZeroShotObjectDetection, AutoProcessor,
-                          SamModel, SamProcessor)
 
 from config import Settings
 
@@ -46,50 +34,95 @@ log = logging.getLogger(__name__)
 @dataclass
 class Cutout:
     label: str
-    score: float                               # Real segmentation IoU confidence score [0.0 - 1.0]
-    bbox: tuple[int, int, int, int]           # x0, y0, x1, y1 in ORIGINAL image pixels
-    png: bytes                                 # RGBA transparent PNG cutout
-    kind: str = "cutout"                       # 'cutout' | 'crop'
+    score: float
+    bbox: tuple[int, int, int, int]           # [x0, y0, x1, y1] non-transparent extent in original pixels
+    png: bytes                                 # Full-canvas transparent RGBA PNG
+    kind: str = "cutout"
     confidence_status: str = "confirmed"       # 'confirmed' | 'needs_review'
     area_ratio: float = 0.0                    # Fraction of image area occupied
-    category: str = "product"                  # Detected category (e.g. package, bottle, sachet)
-    is_completed: bool = False
-    occlusion_ratio: float = 0.0
+    category: str = "product"
+    canvas_width: int = 0
+    canvas_height: int = 0
+    role: str = "standalone"
 
 
 # ---------------------------------------------------------------------------
-# GPT-4o Vision Prompting
+# GPT Asset Decomposition Planner Prompt
 # ---------------------------------------------------------------------------
-GPT_CATALOG_PROMPT = """You are a precision digital asset element cataloger for a Digital Asset Management (DAM) system.
-Analyze this image and identify EVERY distinct, meaningful foreground object or product that should be extracted as an independent, transparent layer.
+GPT_CATALOG_PROMPT = """You are an expert visual asset decomposition planner.
+Analyze the complete image and identify only meaningful, independent visual objects that should become separate image layers.
 
-Strict Rules:
-1. Identify all separate foreground objects (e.g. bottles, boxes, blister packs, sachets, containers, groups of tablets/capsules).
-2. Distinguish between open vs closed packages, and differentiate distinct items (e.g. "yellow blister pack" vs "silver blister pack").
-3. DO NOT include: background, floor, table surfaces, shadows, reflections, pure text stickers on products.
-4. For loose scattered items like pills/tablets/capsules, group contiguous clusters into coherent units (e.g. "scattered white tablets", "green and white capsules").
-5. For each item provide:
-   - "name": Concise human-readable name (1-3 words, e.g. "open cardboard box", "white medicine bottle", "yellow blister pack", "silver blister pack", "white foil sachet", "white round tablets", "green white capsules")
-   - "prompt": A descriptive visual concept phrase (2-5 words) that an open-vocabulary object detector/segmenter can use to localize the item (e.g. "open white cardboard box", "white plastic medicine bottle", "yellow tablet blister pack", "silver tablet blister pack", "white foil sachet packet", "scattered white round tablets", "green and white capsules")
-   - "category": e.g. "box", "bottle", "blister pack", "sachet", "tablet", "capsule", "product"
+IMPORTANT RULES:
+1. Treat each complete physical product or independent object as one layer.
+2. Never extract structural parts of an object separately.
+   Examples:
+   - Box flaps are part of the box.
+   - Bottle caps are part of the bottle.
+   - Handles are part of their parent object.
+   - Packaging folds are part of the packaging.
+   - Product surfaces and printed details are not separate objects.
+3. Do not create separate layers for tiny fragments, edges, reflections, shadows, highlights or visual imperfections.
+4. Do not extract small objects that are physically part of a larger assembled object.
+5. If several loose, similar small objects form one visual group, identify them as one group layer.
+   Examples: scattered tablets, capsules, small beads.
+6. Separate objects only when they are genuinely independent visible objects.
+7. Do not include the background, floor or studio surface.
+8. Do not invent objects that are not visible.
+9. Do not split a single object into multiple overlapping layers.
+10. Do not force a minimum number of objects. If only two meaningful objects exist, return two.
 
-Return JSON with this exact structure:
+For every object return:
+- name: short descriptive name (e.g. "open cardboard box", "white medicine bottle", "blister pack of yellow tablets", "scattered white tablets")
+- prompt: concise visual phrase for SAM 3 segmentation (e.g. "open cardboard box", "white medicine bottle", "blister pack of yellow tablets", "scattered tablets")
+- role: "standalone" or "group"
+- parent: null if independent, or name of parent object if it's a part of something
+- extract: true or false
+- category: e.g. "box", "bottle", "blister pack", "sachet", "tablet", "capsule", "product"
+- reason: why it should be an independent layer
+
+Return valid JSON:
 {
   "inventory": [
     {
-      "name": "...",
-      "prompt": "...",
-      "category": "..."
+      "name": "open cardboard box",
+      "prompt": "open cardboard box",
+      "role": "standalone",
+      "parent": null,
+      "extract": true,
+      "category": "box",
+      "reason": "Complete independent packaging object"
     }
   ]
 }"""
 
 
 # ---------------------------------------------------------------------------
-# Main Extraction Engine
+# Mask Helpers
+# ---------------------------------------------------------------------------
+def _mask_iou(a: np.ndarray, b: np.ndarray) -> float:
+    """Calculate intersection over union between two boolean masks."""
+    intersection = np.count_nonzero(a & b)
+    union = np.count_nonzero(a | b)
+    return float(intersection / max(union, 1))
+
+
+def _clean_mask(mask: np.ndarray, min_component_area: int) -> np.ndarray:
+    """Remove tiny isolated noise fragments from a mask using connected components."""
+    mask_u8 = mask.astype(np.uint8)
+    count, labels, stats, _ = cv2.connectedComponentsWithStats(mask_u8, connectivity=8)
+    cleaned = np.zeros_like(mask_u8)
+    for i in range(1, count):
+        area = stats[i, cv2.CC_STAT_AREA]
+        if area >= min_component_area:
+            cleaned[labels == i] = 1
+    return cleaned.astype(bool)
+
+
+# ---------------------------------------------------------------------------
+# Object Extractor Engine
 # ---------------------------------------------------------------------------
 class ObjectExtractor:
-    """Universal 4-Stage Object Extraction Pipeline."""
+    """GPT Asset Decomposition Planner + SAM 3 Full-Canvas Layer Extraction."""
 
     def __init__(self, s: Settings):
         self.s = s
@@ -97,61 +130,49 @@ class ObjectExtractor:
         self.dtype = torch.float16 if self.device == "cuda" else torch.float32
         log.info("Initializing ObjectExtractor on %s (dtype=%s)", self.device, self.dtype)
 
-        # Stage 1: OpenAI GPT Vision setup
+        # Stage 1: GPT Vision Setup
         self.openai_key = s.openai_api_key
-        log.info("OpenAI GPT Vision configured with model: %s", s.gpt_model)
+        log.info("OpenAI GPT Vision configured (model: %s)", s.gpt_model)
 
-        # Stage 2: Segmentation Models
-        # Check if native SAM 3.1 is available
-        self.sam3_available = False
-        self.sam3_processor = None
-        self.sam3_model = None
-        if s.use_sam3:
+        # Stage 2: SAM 3 / Segmentation Setup
+        log.info("Loading SAM 3 model: %s", s.sam_model)
+        self.sam_processor = None
+        self.sam_model = None
+
+        try:
+            from transformers import Sam3Model, Sam3Processor
+            self.sam_processor = Sam3Processor.from_pretrained(s.sam_model)
+            self.sam_model = Sam3Model.from_pretrained(
+                s.sam_model,
+                torch_dtype=self.dtype
+            ).to(self.device).eval()
+            log.info("SAM 3 loaded successfully from %s", s.sam_model)
+        except Exception as e:
+            log.warning("Could not load Sam3Model/Sam3Processor directly: %s", e)
+            # Fallback to AutoProcessor / AutoModel
             try:
-                from sam3.model_builder import build_sam3_image_model
-                from sam3.model.sam3_image_processor import Sam3Processor
-                log.info("Loading SAM 3.1 image model...")
-                self.sam3_model = build_sam3_image_model()
-                self.sam3_processor = Sam3Processor(self.sam3_model)
-                self.sam3_available = True
-                log.info("SAM 3.1 initialized successfully.")
-            except Exception as e:
-                log.info("SAM 3.1 native package not loaded (%s). Using Grounded-SAM engine.", e)
-
-        # Grounded-SAM engine (Grounding DINO + SAM ViT-Large)
-        log.info("Loading Grounding DINO detector: %s", s.detector_model)
-        self.det_proc = AutoProcessor.from_pretrained(s.detector_model)
-        self.det = AutoModelForZeroShotObjectDetection.from_pretrained(s.detector_model).to(self.device).eval()
-
-        log.info("Loading SAM segmenter: %s", s.sam_model)
-        self.sam_proc = SamProcessor.from_pretrained(s.sam_model)
-        self.sam = SamModel.from_pretrained(s.sam_model, torch_dtype=self.dtype).to(self.device).eval()
-
-        log.info("ObjectExtractor ready.")
+                from transformers import AutoModel, AutoProcessor
+                log.info("Attempting AutoModel/AutoProcessor load for %s", s.sam_model)
+                self.sam_processor = AutoProcessor.from_pretrained(s.sam_model)
+                self.sam_model = AutoModel.from_pretrained(
+                    s.sam_model,
+                    torch_dtype=self.dtype
+                ).to(self.device).eval()
+                log.info("SAM 3 loaded via AutoModel successfully")
+            except Exception as e2:
+                log.error("Failed to load SAM 3 model (%s). Make sure transformers is updated and HuggingFace terms accepted.", e2)
+                raise RuntimeError(
+                    f"SAM 3 model '{s.sam_model}' could not be loaded: {e2}. "
+                    "Ensure access is granted at https://huggingface.co/facebook/sam3 and run `huggingface-cli login`."
+                ) from e2
 
     # ------------------------------------------------------------------
-    # Image Loading & Pre-processing
-    # ------------------------------------------------------------------
-    def _load(self, data: bytes) -> tuple[Image.Image, Image.Image, float]:
-        img = ImageOps.exif_transpose(Image.open(io.BytesIO(data)))
-        has_alpha = img.mode in ("RGBA", "LA") or "transparency" in img.info
-        full_rgba = img.convert("RGBA") if has_alpha else img.convert("RGB").convert("RGBA")
-        rgb = full_rgba.convert("RGB")
-
-        scale = 1.0
-        m = max(rgb.size)
-        if m > self.s.max_working_side:
-            scale = self.s.max_working_side / m
-            rgb = rgb.resize((round(rgb.width * scale), round(rgb.height * scale)), Image.LANCZOS)
-        return full_rgba, rgb, scale
-
-    # ------------------------------------------------------------------
-    # Stage 1: GPT Vision — Semantic Analysis & Inventory
+    # Stage 1: GPT Vision Semantic Analysis & Validation
     # ------------------------------------------------------------------
     def _semantic_analysis(self, image_data: bytes) -> list[dict]:
-        """Query GPT-4o Vision to produce a structured inventory of distinct objects."""
+        """Query GPT-4o Vision to produce a structured inventory of independent objects."""
         if not self.openai_key:
-            log.warning("No OpenAI API key provided. Skipping semantic analysis.")
+            log.warning("No OpenAI API key provided. Cannot run visual asset decomposition.")
             return []
 
         b64 = base64.b64encode(image_data).decode("utf-8")
@@ -194,7 +215,7 @@ class ObjectExtractor:
             content = data["choices"][0]["message"]["content"]
             parsed = json.loads(content)
             items = parsed.get("inventory", [])
-            log.info("GPT Vision identified %d distinct elements: %s",
+            log.info("GPT Vision identified %d raw elements: %s",
                      len(items), [it.get("name") for it in items])
             return items
 
@@ -202,324 +223,343 @@ class ObjectExtractor:
             log.error("GPT Vision semantic analysis failed: %s", e)
             return []
 
-    # ------------------------------------------------------------------
-    # Stage 2: Concept Segmentation (Grounded-SAM / SAM 3.1)
-    # ------------------------------------------------------------------
-    @torch.inference_mode()
-    def _segment_concepts(
-        self,
-        work_img: Image.Image,
-        inventory: list[dict],
-        box_threshold: float,
-        text_threshold: float
-    ) -> list[dict]:
-        """Detect and segment objects using the semantic concept inventory."""
-        if not inventory:
-            return []
+    def _validate_inventory(self, inventory: list[dict]) -> list[dict]:
+        """Filter the GPT inventory: only extractable, independent objects with no parent."""
+        valid = []
+        for item in inventory:
+            # Must explicitly be marked for extraction
+            if not item.get("extract", False):
+                log.debug("Skipping non-extractable element: %s", item.get("name"))
+                continue
+            # Sub-components with a parent object are excluded
+            if item.get("parent"):
+                log.info("Excluding sub-component '%s' (parent: '%s')",
+                         item.get("name"), item.get("parent"))
+                continue
 
-        # Prepare concept prompts
-        prompts = []
-        item_map = {}
-        for idx, item in enumerate(inventory):
-            prompt_str = item.get("prompt") or item.get("name") or "object"
-            cleaned = prompt_str.strip().lower()
-            prompts.append(cleaned)
-            item_map[cleaned] = item
+            name = str(item.get("name", "")).strip()
+            prompt = str(item.get("prompt", "")).strip()
+            if not name or not prompt:
+                continue
 
-        # Build compound detector query separated by '.'
-        compound_prompt = " . ".join(prompts) + " ."
-        log.info("Grounded detector prompt: '%s'", compound_prompt)
-
-        # Grounding DINO detection
-        inputs = self.det_proc(images=work_img, text=compound_prompt, return_tensors="pt").to(self.device)
-        out = self.det(**inputs)
-        kwargs = dict(text_threshold=text_threshold, target_sizes=[work_img.size[::-1]])
-        try:
-            res = self.det_proc.post_process_grounded_object_detection(
-                out, inputs.input_ids, threshold=box_threshold, **kwargs)[0]
-        except TypeError:
-            res = self.det_proc.post_process_grounded_object_detection(
-                out, inputs.input_ids, box_threshold=box_threshold, **kwargs)[0]
-
-        boxes = res["boxes"].float().cpu()
-        scores = res["scores"].float().cpu()
-        labels = [str(l) for l in (res.get("text_labels") or res.get("labels") or [])]
-
-        if len(boxes) == 0:
-            log.info("No detector candidate boxes found.")
-            return []
-
-        # SAM multimask segmentation on detected candidate boxes
-        box_list = boxes.tolist()
-        sam_inputs = self.sam_proc(work_img, input_boxes=[box_list], return_tensors="pt").to(self.device)
-        sam_inputs["pixel_values"] = sam_inputs["pixel_values"].to(self.dtype)
-
-        sam_out = self.sam(**sam_inputs, multimask_output=True)
-        pred_masks = sam_out.pred_masks.float().cpu()    # (1, N, 3, H, W)
-        sam_iou_scores = sam_out.iou_scores.float().cpu()  # (1, N, 3)
-
-        # Select highest-IoU mask for each detection
-        best_indices = sam_iou_scores[0].argmax(dim=-1)  # (N,)
-        selected = []
-        quality_scores = []
-        for k in range(pred_masks.shape[1]):
-            best_k = best_indices[k].item()
-            selected.append(pred_masks[0, k, best_k])
-            quality_scores.append(sam_iou_scores[0, k, best_k].item())
-
-        selected_tensor = torch.stack(selected).unsqueeze(0).unsqueeze(2)  # (1, N, 1, H, W)
-        post_masks = self.sam_proc.image_processor.post_process_masks(
-            selected_tensor,
-            sam_inputs["original_sizes"].cpu(),
-            sam_inputs["reshaped_input_sizes"].cpu()
-        )
-        binary_masks = post_masks[0][:, 0].numpy().astype(bool)  # (N, H, W)
-
-        candidates = []
-        for i in range(len(boxes)):
-            raw_lbl = labels[i] if i < len(labels) else "object"
-            # Find closest matching inventory item
-            matched_item = None
-            for p_key, it in item_map.items():
-                if p_key in raw_lbl or raw_lbl in p_key:
-                    matched_item = it
-                    break
-            if not matched_item:
-                # Find by substring match
-                for p_key, it in item_map.items():
-                    if any(w in p_key for w in raw_lbl.split()):
-                        matched_item = it
-                        break
-
-            final_name = matched_item.get("name") if matched_item else raw_lbl
-            final_cat = matched_item.get("category") if matched_item else "product"
-            sam_score = float(quality_scores[i])
-            det_score = float(scores[i])
-            # Combined confidence: 60% SAM mask quality + 40% detector confidence
-            combined_conf = round(0.60 * sam_score + 0.40 * det_score, 4)
-
-            candidates.append({
-                "label": final_name,
-                "category": final_cat,
-                "box": boxes[i].tolist(),
-                "mask": binary_masks[i],
-                "score": combined_conf,
-                "sam_iou": round(sam_score, 4),
-                "det_score": round(det_score, 4)
+            valid.append({
+                "name": name,
+                "prompt": prompt,
+                "role": item.get("role", "standalone"),
+                "category": item.get("category", "product"),
+                "parent": item.get("parent"),
+                "reason": item.get("reason", "")
             })
 
-        log.info("Segmented %d raw candidates with SAM.", len(candidates))
+        log.info("Validated %d independent asset layers to extract", len(valid))
+        return valid
+
+    # ------------------------------------------------------------------
+    # Stage 2: SAM 3 Concept-by-Concept Segmentation
+    # ------------------------------------------------------------------
+    @torch.inference_mode()
+    def _segment_concepts(self, image: Image.Image, inventory: list[dict]) -> list[dict]:
+        """Segment each concept individually with SAM 3 text-prompt interface.
+
+        Groups (e.g. scattered tablets, capsules) are merged into one combined mask.
+        """
+        candidates = []
+
+        for item in inventory:
+            prompt = item["prompt"]
+            log.info("SAM 3 segmenting prompt: '%s'", prompt)
+
+            inputs = self.sam_processor(
+                images=image,
+                text=prompt,
+                return_tensors="pt"
+            ).to(self.device)
+
+            outputs = self.sam_model(**inputs)
+
+            # Post-process instance segmentation to get masks, boxes, scores
+            if hasattr(self.sam_processor, "post_process_instance_segmentation"):
+                results = self.sam_processor.post_process_instance_segmentation(
+                    outputs,
+                    threshold=self.s.sam_score_threshold,
+                    mask_threshold=self.s.sam_mask_threshold,
+                    target_sizes=inputs["original_sizes"].tolist()
+                )[0]
+            elif hasattr(self.sam_processor, "post_process_masks"):
+                # Alternative SAM 3 transformers output format
+                masks = self.sam_processor.post_process_masks(
+                    outputs.pred_masks,
+                    inputs["original_sizes"],
+                    inputs["reshaped_input_sizes"]
+                )[0]
+                results = {
+                    "masks": masks[:, 0] if masks.ndim == 4 else masks,
+                    "scores": getattr(outputs, "iou_scores", torch.ones(len(masks)))[0],
+                    "boxes": getattr(outputs, "pred_boxes", torch.zeros((len(masks), 4)))[0]
+                }
+            else:
+                log.error("SAM 3 processor has no supported post-processing method.")
+                continue
+
+            masks = results.get("masks", [])
+            scores = results.get("scores", [])
+
+            prompt_masks = []
+            prompt_scores = []
+            for i in range(len(masks)):
+                m_tensor = masks[i].detach().cpu()
+                score_val = float(scores[i].detach().cpu()) if i < len(scores) else 1.0
+
+                if score_val < self.s.sam_score_threshold:
+                    continue
+
+                mask_bool = m_tensor.numpy().astype(bool)
+                if not np.any(mask_bool):
+                    continue
+
+                prompt_masks.append(mask_bool)
+                prompt_scores.append(score_val)
+
+            if not prompt_masks:
+                log.info("No mask met threshold (%.2f) for prompt '%s'", self.s.sam_score_threshold, prompt)
+                continue
+
+            if item.get("role") == "group":
+                # Single unified layer for the entire group (e.g. scattered tablets/capsules)
+                combined_mask = np.logical_or.reduce(prompt_masks)
+                candidates.append({
+                    "label": item["name"],
+                    "category": item.get("category", "product"),
+                    "role": "group",
+                    "mask": combined_mask,
+                    "score": max(prompt_scores)
+                })
+                log.info("Merged %d instances into 1 group layer for '%s'", len(prompt_masks), item["name"])
+            else:
+                # Standalone instances
+                for mask, score in zip(prompt_masks, prompt_scores):
+                    candidates.append({
+                        "label": item["name"],
+                        "category": item.get("category", "product"),
+                        "role": "standalone",
+                        "mask": mask,
+                        "score": score
+                    })
+
         return candidates
 
     # ------------------------------------------------------------------
-    # Stage 3: Python Mask Validation & Quality Assurance
+    # Stage 3: Mask Validation, Fragment Cleanup & Duplicate Suppression
     # ------------------------------------------------------------------
-    def _validate_masks(
-        self,
-        candidates: list[dict],
-        img_w: int,
-        img_h: int
-    ) -> list[dict]:
-        """Validate and filter masks for completeness, boundary leaks, and duplicates."""
-        if not candidates:
-            return []
-
-        img_area = float(img_w * img_h)
+    def _validate_candidates(self, candidates: list[dict], width: int, height: int) -> list[dict]:
+        """Validate masks: remove tiny fragments, suppress duplicates and containment."""
         valid = []
+        image_area = width * height
+        min_area = int(image_area * self.s.min_object_area_ratio)
+        min_width = int(width * self.s.min_object_width_ratio)
+        min_height = int(height * self.s.min_object_height_ratio)
+        min_component_area = max(8, int(image_area * 0.00005))
 
         for c in candidates:
-            mask = c["mask"]
-            mask_pixels = int(np.count_nonzero(mask))
-            area_ratio = mask_pixels / img_area
-
-            # 1. Area filtering (discard tiny noise specks or giant canvas floods)
-            if area_ratio < self.s.min_area_ratio or area_ratio > self.s.max_area_ratio:
-                log.debug("Discarding candidate '%s': area_ratio %.4f out of range", c["label"], area_ratio)
+            # Clean tiny noise specks
+            mask = _clean_mask(c["mask"], min_component_area)
+            ys, xs = np.where(mask)
+            if len(xs) == 0:
                 continue
 
-            # 2. Border check: discard if mask touches all 4 edges (canvas background leak)
-            touches_top = np.any(mask[0, :])
-            touches_bottom = np.any(mask[-1, :])
-            touches_left = np.any(mask[:, 0])
-            touches_right = np.any(mask[:, -1])
-            if touches_top and touches_bottom and touches_left and touches_right:
-                log.debug("Discarding candidate '%s': touches all 4 borders (background flood)", c["label"])
+            x0, x1 = int(xs.min()), int(xs.max()) + 1
+            y0, y1 = int(ys.min()), int(ys.max()) + 1
+            area = int(np.count_nonzero(mask))
+            box_width = x1 - x0
+            box_height = y1 - y0
+
+            # Reject tiny fragments below minimum area or dimension ratios
+            if area < min_area:
+                log.debug("Rejecting '%s': area %d < min_area %d", c["label"], area, min_area)
+                continue
+            if box_width < min_width and box_height < min_height:
+                log.debug("Rejecting '%s': dimensions (%dx%d) too small", c["label"], box_width, box_height)
                 continue
 
-            c["area_ratio"] = round(area_ratio, 4)
+            c["mask"] = mask
+            c["area_ratio"] = round(area / image_area, 4)
             valid.append(c)
 
         if not valid:
             return []
 
-        # Sort descending by confidence score
+        # Sort descending by score
         valid.sort(key=lambda x: x["score"], reverse=True)
 
-        # 3. Duplicate suppression using pairwise mask IoU
+        # Duplicate & containment suppression
         kept: list[dict] = []
         for cand in valid:
             c_mask = cand["mask"]
-            is_dup = False
+            c_area = np.count_nonzero(c_mask)
+            is_duplicate = False
+
             for parent in kept:
                 p_mask = parent["mask"]
-                inter = np.count_nonzero(c_mask & p_mask)
-                union = np.count_nonzero(c_mask | p_mask)
-                iou = inter / (union + 1e-7)
+                p_area = np.count_nonzero(p_mask)
 
-                if iou >= self.s.duplicate_iou_threshold:
-                    is_dup = True
-                    log.debug("Suppressed duplicate '%s' (IoU %.2f with '%s')",
-                              cand["label"], iou, parent["label"])
+                # Pairwise IoU check
+                iou = _mask_iou(c_mask, p_mask)
+                if iou >= self.s.duplicate_mask_iou:
+                    log.info("Suppressed duplicate '%s' (IoU %.2f with '%s')",
+                             cand["label"], iou, parent["label"])
+                    is_duplicate = True
                     break
 
-            if not is_dup:
-                # Assign confidence status based on real SAM mask quality
-                status = "confirmed" if cand["sam_iou"] >= self.s.mask_confidence_threshold else "needs_review"
-                cand["confidence_status"] = status
+                # Containment check: candidate almost entirely inside another larger mask
+                inter = np.count_nonzero(c_mask & p_mask)
+                if c_area > 0 and (inter / c_area) >= self.s.contained_mask_ratio:
+                    # Only suppress if candidate is substantially smaller sub-part
+                    if (c_area / p_area) < 0.60:
+                        log.info("Suppressed contained sub-layer '%s' inside '%s'",
+                                 cand["label"], parent["label"])
+                        is_duplicate = True
+                        break
+
+            if not is_duplicate:
                 kept.append(cand)
 
-        # Respect max_objects limit
         return kept[:self.s.max_objects]
 
     # ------------------------------------------------------------------
-    # Stage 4: Sub-pixel Edge Refinement & Layer Export
+    # Stage 4: Full-Canvas Preservation PNG Export
     # ------------------------------------------------------------------
-    def _refine_and_cutout(
-        self,
-        full_rgba: Image.Image,
-        work_mask: np.ndarray,
-        box: list[float],
-        scale: float
-    ) -> tuple[bytes, tuple[int, int, int, int]]:
-        """Refine mask edges with anti-aliasing and extract transparent RGBA PNG."""
-        W, H = full_rgba.size
-        x0, y0, x1, y1 = (v / scale for v in box)
-        pad_x = (x1 - x0) * self.s.padding_ratio
-        pad_y = (y1 - y0) * self.s.padding_ratio
+    def _export_full_canvas(self, original: Image.Image, mask: np.ndarray) -> bytes:
+        """Export full-canvas PNG: object stays in exact original position; outside is transparent.
 
-        bx = (
-            max(0, int(x0 - pad_x)),
-            max(0, int(y0 - pad_y)),
-            min(W, int(x1 + pad_x)),
-            min(H, int(y1 + pad_y))
-        )
-        rx0, ry0, rx1, ry1 = bx
+        Canvas dimensions, coordinate system, and scale are 100% identical to the source image.
+        """
+        width, height = original.size
 
-        # Upscale mask to full original resolution with bilinear interpolation
-        mask_uint8 = work_mask.astype(np.uint8) * 255
-        full_mask_pil = Image.fromarray(mask_uint8, mode="L").resize((W, H), Image.BILINEAR)
-        alpha_full = np.array(full_mask_pil, dtype=np.float32)
+        # Resize mask to exact original image dimensions
+        mask_image = Image.fromarray(mask.astype(np.uint8) * 255, mode="L")
+        alpha = mask_image.resize((width, height), Image.Resampling.BILINEAR)
 
-        # Crop to padded bounding box
-        alpha_crop = alpha_full[ry0:ry1, rx0:rx1]
+        # Preserve the original canvas and exact pixel positions
+        layer = original.convert("RGBA").copy()
+        layer.putalpha(alpha)
 
-        # Gentle 1px morphological cleanup to trim stray edge noise
-        binary_crop = (alpha_crop > 127).astype(np.uint8)
-        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
-        clean_binary = cv2.morphologyEx(binary_crop, cv2.MORPH_OPEN, kernel)
-
-        # Sub-pixel anti-aliasing edge softening
-        smoothed = cv2.GaussianBlur(clean_binary.astype(np.float32) * 255.0, (3, 3), 0)
-        # Keep solid interior at 255, apply softened values at the edge band
-        final_alpha = np.where(clean_binary > 0, 255.0, smoothed)
-        final_alpha = np.clip(final_alpha, 0, 255).astype(np.uint8)
-
-        # Produce RGBA cutout
-        crop_rgba = full_rgba.crop(bx)
-        crop_rgba.putalpha(Image.fromarray(final_alpha))
-
-        return _png(crop_rgba), bx
+        buffer = io.BytesIO()
+        layer.save(buffer, format="PNG", optimize=True)
+        return buffer.getvalue()
 
     # ------------------------------------------------------------------
-    # Main Universal Extract Entrypoint
+    # Main Extraction Orchestration
     # ------------------------------------------------------------------
     def extract(
         self,
         data: bytes,
-        labels: list[str] | None = None,
         return_diagnostics: bool = False,
         **kwargs
     ) -> list[Cutout] | tuple[list[Cutout], dict]:
-        """4-Stage Universal Extraction:
-        GPT Vision -> Open-Vocabulary SAM -> Validation -> Refined Layers.
+        """Universal Extraction Engine:
+        1. GPT Semantic Asset Decomposition Planner
+        2. SAM 3 Text-Prompted Concept Segmentation
+        3. Mask Validation, Fragment & Duplicate Filtering
+        4. Full-Canvas PNG Generation
         """
-        full_rgba, work_rgb, scale = self._load(data)
-        W, H = full_rgba.size
-        w, h = work_rgb.size
+        # Load original image and working image
+        original = ImageOps.exif_transpose(
+            Image.open(io.BytesIO(data))
+        ).convert("RGBA")
+        width, height = original.size
 
-        # Stage 1: GPT Vision Semantic Analysis
-        if labels and len(labels) > 0:
-            inventory = [{"name": l.strip(), "prompt": l.strip(), "category": "custom"}
-                         for l in labels if l.strip()]
-            log.info("Using user-supplied concept inventory: %s", [it["name"] for it in inventory])
-        else:
-            inventory = self._semantic_analysis(data)
-
-        # Fallback if GPT analysis returned nothing
-        if not inventory:
-            default_labels = ["package", "bottle", "box", "product", "item", "container"]
-            inventory = [{"name": l, "prompt": l, "category": "general"} for l in default_labels]
-
-        # Stage 2: Concept Segmentation (SAM / Grounded-SAM)
-        raw_candidates = self._segment_concepts(
-            work_img=work_rgb,
-            inventory=inventory,
-            box_threshold=self.s.box_threshold,
-            text_threshold=self.s.text_threshold
-        )
-
-        # Stage 3: Python Mask Validation & Quality Assurance
-        validated = self._validate_masks(raw_candidates, w, h)
-
-        # Stage 4: Edge Refinement & PNG Generation
-        results: list[Cutout] = []
-        for v in validated:
-            png_bytes, bx = self._refine_and_cutout(
-                full_rgba=full_rgba,
-                work_mask=v["mask"],
-                box=v["box"],
-                scale=scale
+        work = original.convert("RGB")
+        max_side = self.s.max_working_side
+        scale = 1.0
+        if max(work.size) > max_side:
+            scale = max_side / max(work.size)
+            work = work.resize(
+                (round(work.width * scale), round(work.height * scale)),
+                Image.Resampling.LANCZOS
             )
-            results.append(Cutout(
-                label=v["label"],
-                score=v["score"],
-                bbox=bx,
+
+        # 1. GPT semantic inventory
+        raw_inventory = self._semantic_analysis(data)
+        inventory = self._validate_inventory(raw_inventory)
+
+        if not inventory:
+            diagnostics = {
+                "status": "NeedsReview",
+                "reason": "No valid independent objects identified by visual decomposition planner",
+                "total_extracted": 0,
+                "layers": []
+            }
+            log.warning("Decomposition planner returned no valid independent objects.")
+            return ([], diagnostics) if return_diagnostics else []
+
+        # 2. SAM 3 concept-by-concept segmentation
+        candidates = self._segment_concepts(work, inventory)
+
+        # 3. Mask validation, fragment cleanup & duplicate suppression
+        w_work, h_work = work.size
+        validated = self._validate_candidates(candidates, w_work, h_work)
+
+        # 4. Full-canvas PNG generation
+        cutouts: list[Cutout] = []
+        for cand in validated:
+            work_mask = cand["mask"]
+            # Upscale mask to full original resolution for precise bounding box computation
+            mask_pil = Image.fromarray(work_mask.astype(np.uint8) * 255, mode="L").resize(
+                (width, height), Image.Resampling.BILINEAR
+            )
+            full_mask = np.array(mask_pil) > 127
+
+            ys, xs = np.where(full_mask)
+            if len(xs) == 0:
+                continue
+
+            # Bounding box measured in original image coordinates
+            bbox = (
+                int(xs.min()),
+                int(ys.min()),
+                int(xs.max()) + 1,
+                int(ys.max()) + 1
+            )
+
+            # Export full-canvas PNG (same dimensions, same coordinates, outside transparent)
+            png_bytes = self._export_full_canvas(original, full_mask)
+
+            status = "confirmed" if cand["score"] >= self.s.sam_score_threshold else "needs_review"
+            cutouts.append(Cutout(
+                label=cand["label"],
+                score=round(cand["score"], 4),
+                bbox=bbox,
                 png=png_bytes,
                 kind="cutout",
-                confidence_status=v["confidence_status"],
-                area_ratio=v["area_ratio"],
-                category=v["category"]
+                confidence_status=status,
+                area_ratio=cand["area_ratio"],
+                category=cand["category"],
+                canvas_width=width,
+                canvas_height=height,
+                role=cand.get("role", "standalone")
             ))
 
-        review_needed = any(r.confidence_status == "needs_review" for r in results)
+        review_needed = any(c.confidence_status == "needs_review" for c in cutouts)
         diagnostics = {
-            "semantic_inventory": [it["name"] for it in inventory],
-            "raw_candidates_count": len(raw_candidates),
-            "validated_objects_count": len(validated),
-            "total_extracted": len(results),
+            "status": "NeedsReview" if review_needed else "Completed",
+            "canvas_dimensions": {"width": width, "height": height},
+            "inventory_planned": [it["name"] for it in inventory],
+            "total_extracted": len(cutouts),
             "review_needed": review_needed,
-            "detected_objects": [
+            "layers": [
                 {
-                    "label": r.label,
-                    "score": r.score,
-                    "confidence_status": r.confidence_status,
-                    "area_ratio": r.area_ratio,
-                    "category": r.category,
-                    "bbox": list(r.bbox)
+                    "label": c.label,
+                    "score": c.score,
+                    "status": c.confidence_status,
+                    "bbox": list(c.bbox),
+                    "area_ratio": c.area_ratio,
+                    "category": c.category,
+                    "role": c.role,
+                    "canvas": [c.canvas_width, c.canvas_height]
                 }
-                for r in results
+                for c in cutouts
             ]
         }
 
-        log.info("Extraction complete: %d clean layers generated (review_needed=%s)",
-                 len(results), review_needed)
-        return (results, diagnostics) if return_diagnostics else results
-
-
-# ---------------------------------------------------------------------------
-# Helper
-# ---------------------------------------------------------------------------
-def _png(img: Image.Image) -> bytes:
-    buf = io.BytesIO()
-    img.save(buf, "PNG", optimize=True)
-    return buf.getvalue()
+        log.info("Extracted %d full-canvas layers (review_needed=%s)", len(cutouts), review_needed)
+        return (cutouts, diagnostics) if return_diagnostics else cutouts

@@ -1,11 +1,12 @@
 """Test Universal AI Object Extraction locally: python local_test.py <image_path> [output_dir]
 
-Runs the 4-Stage Architecture:
-1. GPT Vision Semantic Analysis -> Clean Object Inventory
-2. Concept Segmentation (Grounded-SAM / SAM 3.1)
-3. Python Mask Validation & Quality Assurance
-4. Sub-pixel Edge Refinement & Transparent Layer Generation
+Strict Verification Rules:
+1. Every extracted PNG must have EXACTLY the same width, height and coordinate system as the original image.
+2. The extracted object stays in its original position; all pixels outside its mask become transparent.
+3. No fragments or sub-components (caps, flaps) are extracted as independent layers.
+4. Grouped items (scattered tablets/capsules) are unified into a single group layer.
 """
+import io
 import os
 import sys
 
@@ -32,39 +33,52 @@ if not os.path.exists(src):
     sys.exit(1)
 
 os.makedirs(out, exist_ok=True)
-print(f"Initializing 4-Stage Extraction Pipeline and analyzing '{src}'...")
+source = Image.open(src)
+original_size = source.size
+print(f"Loaded source image '{src}' with original dimensions: {original_size} (WxH)")
+
 settings = Settings()
 ex = ObjectExtractor(settings)
 data = open(src, "rb").read()
 cutouts, diag = ex.extract(data, return_diagnostics=True)
 
-print(f"\n{'='*65}")
+print(f"\n{'='*70}")
 print(f"UNIVERSAL AI OBJECT EXTRACTION SUMMARY:")
-print(f"GPT Semantic Inventory:   {diag.get('semantic_inventory', [])}")
-print(f"Raw Candidates Detected: {diag.get('raw_candidates_count', 0)}")
-print(f"Validated Layers Extracted: {len(cutouts)}")
+print(f"Planned Inventory:       {diag.get('inventory_planned', [])}")
+print(f"Total Layers Extracted:  {len(cutouts)}")
 print(f"Review Needed:           {diag.get('review_needed', False)}")
-print(f"{'='*65}\n")
+print(f"{'='*70}\n")
 
-preview = Image.open(src).convert("RGB")
+# Annotated preview image
+preview = source.convert("RGB")
 d = ImageDraw.Draw(preview)
 
-for i, c in enumerate(cutouts, 1):
-    safe_name = c.label.lower().replace(" ", "_").replace("/", "-")
-    filename = f"{i:02d}_{safe_name}_{c.confidence_status}.png"
+for i, cutout in enumerate(cutouts, 1):
+    output_image = Image.open(io.BytesIO(cutout.png)).convert("RGBA")
+
+    # Strict assertion: full canvas dimensions must match original
+    assert output_image.size == original_size, (
+        f"Layer {i} has incorrect dimensions: {output_image.size}, expected {original_size}"
+    )
+
+    alpha = output_image.getchannel("A")
+    non_transparent_box = alpha.getbbox()
+
+    safe_name = cutout.label.lower().replace(" ", "_").replace("/", "-")
+    filename = f"{i:02d}_{safe_name}.png"
     filepath = os.path.join(out, filename)
-    open(filepath, "wb").write(c.png)
+    open(filepath, "wb").write(cutout.png)
 
-    # Color code: Green = confirmed, Amber = needs_review
-    color = "#00E676" if c.confidence_status == "confirmed" else "#FF9100"
-    d.rectangle(c.bbox, outline=color, width=4)
-    tag = f"{c.label} ({c.score:.2f}) [{c.confidence_status}]"
-    d.text((c.bbox[0] + 6, max(0, c.bbox[1] - 16)), tag, fill=color)
+    # Annotate on preview
+    color = "#00E676" if cutout.confidence_status == "confirmed" else "#FF9100"
+    d.rectangle(cutout.bbox, outline=color, width=4)
+    tag = f"{cutout.label} ({cutout.score:.2f}) [{cutout.role}]"
+    d.text((cutout.bbox[0] + 6, max(0, cutout.bbox[1] - 16)), tag, fill=color)
 
-    print(f"  [{i:02d}] {c.label:24s} (score: {c.score:.2f}, status: {c.confidence_status:12s}, "
-          f"area: {c.area_ratio:.3f}, cat: {c.category:10s}) -> {filename}")
+    print(f"  [{i:02d}] {cutout.label:28s} | size={output_image.size} | "
+          f"object_bbox={non_transparent_box} | score={cutout.score:.2f} | role={cutout.role} -> {filename}")
 
 preview_path = os.path.join(out, "_preview.jpg")
 preview.save(preview_path, quality=92)
-print(f"\nPreview saved to: {preview_path}")
-print(f"All {len(cutouts)} transparent layers saved to: '{out}/'\n")
+print(f"\nPreview comparison saved to: {preview_path}")
+print(f"All {len(cutouts)} full-canvas transparent layers saved to: '{out}/'\n")

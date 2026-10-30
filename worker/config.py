@@ -24,6 +24,9 @@ class Settings:
     prop_label: str = field(default_factory=lambda: _env("PROP_LABEL", "CutoutLabel"))
     prop_confidence: str = field(default_factory=lambda: _env("PROP_CONFIDENCE", "CutoutConfidence"))
     prop_bbox: str = field(default_factory=lambda: _env("PROP_BBOX", "CutoutBoundingBox"))
+    prop_canvas_width: str = field(default_factory=lambda: _env("PROP_CANVAS_WIDTH", "CutoutCanvasWidth"))
+    prop_canvas_height: str = field(default_factory=lambda: _env("PROP_CANVAS_HEIGHT", "CutoutCanvasHeight"))
+    prop_area_ratio: str = field(default_factory=lambda: _env("PROP_AREA_RATIO", "CutoutAreaRatio"))
     prop_status: str = field(default_factory=lambda: _env("PROP_STATUS", "ObjectExtractionStatus"))
     prop_count: str = field(default_factory=lambda: _env("PROP_COUNT", "ObjectExtractionCount"))
     prop_message: str = field(default_factory=lambda: _env("PROP_MESSAGE", "ObjectExtractionMessage"))
@@ -36,54 +39,50 @@ class Settings:
     sb_connection: str = field(default_factory=lambda: _env("SB_CONNECTION", required=True))
     sb_queue: str = field(default_factory=lambda: _env("SB_QUEUE", "ch-object-extraction"))
 
-    # --- Stage 1: GPT Vision (Semantic Analysis & Object Inventory) ---
+    # --- GPT Vision (Semantic Analysis & Asset Decomposition) ---
     openai_api_key: str = field(default_factory=lambda: _env("OPENAI_API_KEY", ""))
     gpt_model: str = field(default_factory=lambda: _env("GPT_MODEL", "gpt-4o"))
 
-    # --- Stage 2: Concept Segmentation Models ---
-    # SAM 3.1 open-vocabulary support (if installed and authenticated)
-    use_sam3: bool = field(
-        default_factory=lambda: _env("USE_SAM3", "auto").lower() in ("true", "1", "yes", "auto")
-    )
-    sam3_model: str = field(default_factory=lambda: _env("SAM3_MODEL", "facebook/sam3"))
-
-    # High-precision Grounded-SAM fallback (open-vocabulary Grounding DINO + SAM ViT-Large)
-    detector_model: str = field(
-        default_factory=lambda: _env("DETECTOR_MODEL", "IDEA-Research/grounding-dino-base")
-    )
+    # --- SAM 3 Segmentation ---
     sam_model: str = field(
-        default_factory=lambda: _env("SAM_MODEL", "facebook/sam-vit-large")
+        default_factory=lambda: _env("SAM_MODEL", "facebook/sam3")
+    )
+    sam_score_threshold: float = field(
+        default_factory=lambda: float(_env("SAM_SCORE_THRESHOLD", "0.55"))
+    )
+    sam_mask_threshold: float = field(
+        default_factory=lambda: float(_env("SAM_MASK_THRESHOLD", "0.50"))
     )
 
-    box_threshold: float = field(
-        default_factory=lambda: float(_env("BOX_THRESHOLD", "0.20"))
+    # --- Object Size & Fragment Filters ---
+    min_object_area_ratio: float = field(
+        default_factory=lambda: float(_env("MIN_OBJECT_AREA_RATIO", "0.003"))
     )
-    text_threshold: float = field(
-        default_factory=lambda: float(_env("TEXT_THRESHOLD", "0.18"))
+    min_object_width_ratio: float = field(
+        default_factory=lambda: float(_env("MIN_OBJECT_WIDTH_RATIO", "0.025"))
+    )
+    min_object_height_ratio: float = field(
+        default_factory=lambda: float(_env("MIN_OBJECT_HEIGHT_RATIO", "0.025"))
     )
 
-    # --- Stage 3: Mask Validation & Quality Assurance ---
-    mask_confidence_threshold: float = field(
-        default_factory=lambda: float(_env("MASK_CONFIDENCE_THRESHOLD", "0.68"))
+    # --- Duplicate & Containment Controls ---
+    duplicate_mask_iou: float = field(
+        default_factory=lambda: float(_env("DUPLICATE_MASK_IOU", "0.75"))
     )
-    duplicate_iou_threshold: float = field(
-        default_factory=lambda: float(_env("DUPLICATE_IOU_THRESHOLD", "0.55"))
-    )
-    min_area_ratio: float = field(
-        default_factory=lambda: float(_env("MIN_AREA_RATIO", "0.002"))
-    )
-    max_area_ratio: float = field(
-        default_factory=lambda: float(_env("MAX_AREA_RATIO", "0.92"))
+    contained_mask_ratio: float = field(
+        default_factory=lambda: float(_env("CONTAINED_MASK_RATIO", "0.90"))
     )
     max_objects: int = field(
-        default_factory=lambda: int(_env("MAX_OBJECTS", "25"))
+        default_factory=lambda: int(_env("MAX_OBJECTS", "20"))
     )
     min_objects_to_split: int = field(
         default_factory=lambda: int(_env("MIN_OBJECTS_TO_SPLIT", "1"))
     )
 
-    # --- Stage 4: Layer Generation & Edge Refinement ---
-    padding_ratio: float = field(default_factory=lambda: float(_env("PADDING_RATIO", "0.03")))
-    max_working_side: int = field(default_factory=lambda: int(_env("MAX_WORKING_SIDE", "4096")))
-    output_mode: str = field(default_factory=lambda: _env("OUTPUT_MODE", "cutout"))  # cutout | crop | both
-    rendition_wait_seconds: int = field(default_factory=lambda: int(_env("RENDITION_WAIT_SECONDS", "240")))
+    # --- Image Processing ---
+    max_working_side: int = field(
+        default_factory=lambda: int(_env("MAX_WORKING_SIDE", "4096"))
+    )
+    rendition_wait_seconds: int = field(
+        default_factory=lambda: int(_env("RENDITION_WAIT_SECONDS", "240"))
+    )
