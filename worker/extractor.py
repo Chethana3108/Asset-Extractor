@@ -502,7 +502,8 @@ class ObjectExtractor:
         selected = []
         for k in range(pred_masks.shape[1]):
             selected.append(pred_masks[0, k, best_idx[k]])  # (H, W)
-        selected_masks = torch.stack(selected).unsqueeze(1)  # (N, 1, H, W)
+        # Reshape to (1, N, 1, H, W) — batch=1, N queries, 1 mask each
+        selected_masks = torch.stack(selected).unsqueeze(0).unsqueeze(2)
         masks = self.sam_proc.image_processor.post_process_masks(
             selected_masks, inputs["original_sizes"].cpu(), inputs["reshaped_input_sizes"].cpu())
         return masks[0][:, 0].numpy().astype(bool)  # (N, H, W)
