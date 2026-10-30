@@ -42,8 +42,10 @@ def health():
     device_name = torch.cuda.get_device_name(0) if cuda_available else "CPU"
     return {
         "status": "healthy",
+        "version": "2.2-multipass",
         "cuda_available": cuda_available,
         "device": device_name,
+        "use_multi_pass": settings.use_multi_pass if settings else True,
         "labels": settings.labels if settings else []
     }
 
@@ -65,6 +67,7 @@ async def extract_objects(
     nms_iou: Optional[float] = Form(default=None),
     max_objects: Optional[int] = Form(default=None),
     min_objects_to_split: Optional[int] = Form(default=None),
+    use_multi_pass: bool = Form(default=True),
 ):
     """Upload an image file and receive detected objects, bounding boxes, confidence scores, and cutout PNGs."""
     if file.content_type and not file.content_type.startswith("image/"):
@@ -81,7 +84,8 @@ async def extract_objects(
             min_area_ratio=min_area_ratio,
             nms_iou=nms_iou,
             max_objects=max_objects,
-            min_objects_to_split=min_objects_to_split
+            min_objects_to_split=min_objects_to_split,
+            use_multi_pass=use_multi_pass
         )
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Extraction failed: {str(e)}")
@@ -121,6 +125,7 @@ async def extract_preview(
     nms_iou: Optional[float] = Form(default=None),
     max_objects: Optional[int] = Form(default=None),
     min_objects_to_split: Optional[int] = Form(default=None),
+    use_multi_pass: bool = Form(default=True),
 ):
     """Upload an image file and receive the annotated image (JPEG) with bounding boxes and labels drawn."""
     image_bytes = await file.read()
@@ -134,7 +139,8 @@ async def extract_preview(
             min_area_ratio=min_area_ratio,
             nms_iou=nms_iou,
             max_objects=max_objects,
-            min_objects_to_split=min_objects_to_split
+            min_objects_to_split=min_objects_to_split,
+            use_multi_pass=use_multi_pass
         )
         img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
         draw = ImageDraw.Draw(img)

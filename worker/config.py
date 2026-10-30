@@ -69,6 +69,9 @@ class Settings:
     min_objects_to_split: int = field(
         default_factory=lambda: int(_env("MIN_OBJECTS_TO_SPLIT", "2"))
     )
+    use_multi_pass: bool = field(
+        default_factory=lambda: _env("USE_MULTI_PASS", "true").lower() in ("true", "1", "yes")
+    )
     padding_ratio: float = field(default_factory=lambda: float(_env("PADDING_RATIO", "0.04")))
     max_working_side: int = field(default_factory=lambda: int(_env("MAX_WORKING_SIDE", "4096")))
     output_mode: str = field(default_factory=lambda: _env("OUTPUT_MODE", "cutout"))  # cutout | crop | both

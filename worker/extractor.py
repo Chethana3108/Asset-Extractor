@@ -31,6 +31,69 @@ class Cutout:
     kind: str                         # 'cutout' | 'crop'
 
 
+@dataclass
+class CategoryRule:
+    name: str
+    prompt: str
+    box_threshold: float
+    text_threshold: float
+    min_area_ratio: float
+    max_area_ratio: float = 0.95
+
+
+DEFAULT_CATEGORY_RULES: list[CategoryRule] = [
+    CategoryRule(
+        name="box",
+        prompt="a medicine carton . a medicine box . a packaging box . a box .",
+        box_threshold=0.22,
+        text_threshold=0.18,
+        min_area_ratio=0.005,
+    ),
+    CategoryRule(
+        name="bottle",
+        prompt="a medicine bottle . a plastic bottle . a pill bottle . a bottle . a pill container .",
+        box_threshold=0.22,
+        text_threshold=0.18,
+        min_area_ratio=0.005,
+    ),
+    CategoryRule(
+        name="sachet",
+        prompt="a sachet . a packet . a white pouch . a medicine sachet . a paper sachet . a foil packet .",
+        box_threshold=0.14,
+        text_threshold=0.14,
+        min_area_ratio=0.001,
+    ),
+    CategoryRule(
+        name="blister_pack",
+        prompt="a blister pack . a tablet strip . a pill pack . a medicine strip . a blister foil .",
+        box_threshold=0.16,
+        text_threshold=0.15,
+        min_area_ratio=0.002,
+    ),
+    CategoryRule(
+        name="pill",
+        prompt="a tablet . a capsule . a pill . a loose pill . a white pill . a green capsule .",
+        box_threshold=0.14,
+        text_threshold=0.14,
+        min_area_ratio=0.00005,
+    ),
+]
+
+
+def _box_area(box: list[float]) -> float:
+    return max(0.0, box[2] - box[0]) * max(0.0, box[3] - box[1])
+
+
+def _intersection_area(b1: list[float], b2: list[float]) -> float:
+    ix0 = max(b1[0], b2[0])
+    iy0 = max(b1[1], b2[1])
+    ix1 = min(b1[2], b2[2])
+    iy1 = min(b1[3], b2[3])
+    if ix1 <= ix0 or iy1 <= iy0:
+        return 0.0
+    return (ix1 - ix0) * (iy1 - iy0)
+
+
 def _format_prompt(labels: list[str]) -> str:
     cleaned = [l.strip().lower() for l in labels if l.strip()]
     return " . ".join(cleaned) + " ."
@@ -98,6 +161,47 @@ class ObjectExtractor:
             out.pred_masks.float().cpu(), inputs["original_sizes"].cpu(), inputs["reshaped_input_sizes"].cpu())
         return masks[0][:, 0].numpy().astype(bool)  # (N, H, W)
 
+    def _multi_pass_detect(self, img: Image.Image, max_objects: int, nms_iou: float) -> list[tuple[list[float], float, str]]:
+        w, h = img.size
+        category_detections: list[tuple[list[float], float, str]] = []
+
+        for rule in DEFAULT_CATEGORY_RULES:
+            boxes, scores, labels = self._detect(img, rule.prompt, rule.box_threshold, rule.text_threshold)
+            filtered = self._filter(
+                boxes, scores, labels, w, h,
+                min_area_ratio=rule.min_area_ratio,
+                max_area_ratio=rule.max_area_ratio,
+                nms_iou=0.60,
+                max_objects=max_objects
+            )
+            for box, score, _ in filtered:
+                category_detections.append((box, score, rule.name))
+
+        if not category_detections:
+            return []
+
+        # Filter out pills that are inside a blister pack
+        blister_boxes = [d[0] for d in category_detections if d[2] == "blister_pack"]
+        final_candidates: list[tuple[list[float], float, str]] = []
+        for box, score, label in category_detections:
+            if label == "pill" and blister_boxes:
+                p_area = _box_area(box)
+                inside = any((_intersection_area(box, bb) / p_area) > 0.60 for bb in blister_boxes if p_area > 0)
+                if inside:
+                    continue  # Keep blister pack intact, skip individual bubbles
+            final_candidates.append((box, score, label))
+
+        if not final_candidates:
+            return []
+
+        # Cross-category NMS to collapse duplicate detections of the exact same object
+        c_boxes = torch.tensor([d[0] for d in final_candidates], dtype=torch.float32)
+        c_scores = torch.tensor([d[1] for d in final_candidates], dtype=torch.float32)
+        keep_idx = nms(c_boxes, c_scores, 0.70)
+
+        selected = [final_candidates[i] for i in keep_idx][:max_objects]
+        return selected
+
     # ------------------------------------------------------------------
     def extract(
         self,
@@ -110,21 +214,28 @@ class ObjectExtractor:
         nms_iou: float | None = None,
         max_objects: int | None = None,
         min_objects_to_split: int | None = None,
+        use_multi_pass: bool | None = None,
     ) -> list[Cutout]:
-        box_th = box_threshold if box_threshold is not None else self.s.box_threshold
-        text_th = text_threshold if text_threshold is not None else self.s.text_threshold
-        min_area = min_area_ratio if min_area_ratio is not None else self.s.min_area_ratio
-        max_area = max_area_ratio if max_area_ratio is not None else self.s.max_area_ratio
-        iou = nms_iou if nms_iou is not None else self.s.nms_iou
+        multi_pass = use_multi_pass if use_multi_pass is not None else self.s.use_multi_pass
         max_obj = max_objects if max_objects is not None else self.s.max_objects
         min_split = min_objects_to_split if min_objects_to_split is not None else self.s.min_objects_to_split
-
-        prompt = _format_prompt(labels if labels is not None else self.s.labels)
+        iou = nms_iou if nms_iou is not None else self.s.nms_iou
 
         full, work, scale = self._load(data)
-        boxes, scores, det_labels = self._detect(work, prompt, box_th, text_th)
-        dets = self._filter(boxes, scores, det_labels, *work.size, min_area, max_area, iou, max_obj)
-        log.info("Detected %d objects after filtering (threshold=%.2f, min_area=%.4f)", len(dets), box_th, min_area)
+
+        if multi_pass and labels is None:
+            dets = self._multi_pass_detect(work, max_objects=max_obj, nms_iou=iou)
+            log.info("Multi-pass detected %d objects", len(dets))
+        else:
+            box_th = box_threshold if box_threshold is not None else self.s.box_threshold
+            text_th = text_threshold if text_threshold is not None else self.s.text_threshold
+            min_area = min_area_ratio if min_area_ratio is not None else self.s.min_area_ratio
+            max_area = max_area_ratio if max_area_ratio is not None else self.s.max_area_ratio
+            prompt = _format_prompt(labels if labels is not None else self.s.labels)
+            boxes, scores, det_labels = self._detect(work, prompt, box_th, text_th)
+            dets = self._filter(boxes, scores, det_labels, *work.size, min_area, max_area, iou, max_obj)
+            log.info("Single-pass detected %d objects after filtering (threshold=%.2f, min_area=%.4f)", len(dets), box_th, min_area)
+
         if len(dets) < min_split:
             return []
 
